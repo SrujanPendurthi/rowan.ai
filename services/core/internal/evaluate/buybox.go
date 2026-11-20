@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 )
 
 type Criteria struct {
@@ -34,6 +35,18 @@ func ParseCriteria(raw json.RawMessage) (Criteria, error) {
 			return Criteria{}, fmt.Errorf("parse criteria: trailing JSON value")
 		}
 		return Criteria{}, fmt.Errorf("parse criteria: %w", err)
+	}
+	for _, list := range [][]string{c.NAICSIn, c.ExcludeNAICS, c.StatesIn, c.ExcludeStates} {
+		for _, v := range list {
+			if strings.TrimSpace(v) == "" {
+				return Criteria{}, fmt.Errorf("parse criteria: blank list entry")
+			}
+		}
+	}
+	for _, bound := range []*int64{c.RevenueMinCents, c.RevenueMaxCents, c.HeadcountMin, c.HeadcountMax, c.ContractValueMinCents} {
+		if bound != nil && *bound < 0 {
+			return Criteria{}, fmt.Errorf("parse criteria: negative bound")
+		}
 	}
 	if c.RevenueMinCents != nil && c.RevenueMaxCents != nil && *c.RevenueMinCents > *c.RevenueMaxCents {
 		return Criteria{}, fmt.Errorf("parse criteria: revenue minimum exceeds maximum")

@@ -88,3 +88,31 @@ func TestMalformedAndMissingCitation(t *testing.T) {
 		t.Fatal(got)
 	}
 }
+
+func TestParseCriteriaRejectsBlankListEntries(t *testing.T) {
+	for _, raw := range []string{
+		`{"naics_in":[""]}`, `{"naics_in":["2382"," "]}`, `{"exclude_naics":["\t"]}`,
+		`{"states_in":[""]}`, `{"exclude_states":["  "]}`,
+	} {
+		if _, err := ParseCriteria(json.RawMessage(raw)); err == nil {
+			t.Fatalf("accepted blank list entry: %s", raw)
+		}
+	}
+}
+
+func TestParseCriteriaRejectsNegativeBounds(t *testing.T) {
+	for _, raw := range []string{
+		`{"revenue_min_cents":-1}`, `{"revenue_max_cents":-1}`, `{"headcount_min":-1}`,
+		`{"headcount_max":-5}`, `{"contract_value_min_cents":-1}`,
+	} {
+		if _, err := ParseCriteria(json.RawMessage(raw)); err == nil {
+			t.Fatalf("accepted negative bound: %s", raw)
+		}
+	}
+}
+
+func TestParseCriteriaAcceptsZeroBoundAndValues(t *testing.T) {
+	if _, err := ParseCriteria(json.RawMessage(`{"naics_in":["2382"],"headcount_min":0}`)); err != nil {
+		t.Fatal(err)
+	}
+}
