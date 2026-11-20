@@ -127,12 +127,31 @@ func TestSplitPreventsRemerge(t *testing.T) {
 	if d.Decision != AutoMerge || d.CanonicalID != newID {
 		t.Fatalf("new record should merge into split canonical: %+v", d)
 	}
-	// A new record matching both sides must not rejoin the original blindly: it only
-	// qualifies for canonicals with no do-not-merge pair against it, so C still stays put.
+	// Linked records keep their link on content change (Resolve's linked branch).
 	cin := recordInput(w, "C", RecordFacts{LegalName: "Cee Corp 2", IDs: map[string]string{"ein": "1", "duns": "c-only"}})
 	again := ingest(t, pool, cin)
 	if again.CanonicalID != newID || linkCanonical(t, pool, c.SourceRecordID) != newID {
 		t.Fatalf("re-ingested C left split canonical: %+v", again)
+	}
+
+	// Blocking via review: a pending candidate pointing C back at the original must not merge.
+	cand := seedID(t, pool, `INSERT INTO possible_match_candidates(workspace_id,canonical_company_id,source_record_id,score,match_reasons,status)
+		VALUES ($1,$2,$3,.7,'{x}','pending') RETURNING id::text`, w, canonical, c.SourceRecordID)
+	if err := review(t, pool, cand, "merge", resolverNow); !errors.Is(err, ErrDoNotMerge) {
+		t.Fatalf("want ErrDoNotMerge, got %v", err)
+	}
+	if linkCanonical(t, pool, c.SourceRecordID) != newID ||
+		seedID(t, pool, `SELECT status FROM possible_match_candidates WHERE id=$1`, cand) != "pending" {
+		t.Fatal("blocked review merge wrote")
+	}
+
+	// Blocking via Resolve's unlinked path: drop C's link and canonical, re-ingest with a
+	// hard-ID match to A. Without the pair it would auto-merge into the original.
+	execSQL(t, pool, `DELETE FROM canonical_companies WHERE id=$1`, newID)
+	cin = recordInput(w, "C", RecordFacts{LegalName: "Cee Corp 3", IDs: map[string]string{"ein": "1"}})
+	relinked := ingest(t, pool, cin)
+	if relinked.CanonicalID == canonical || relinked.CanonicalID == newID || relinked.Decision == AutoMerge {
+		t.Fatalf("re-ingested C merged into original despite pair: %+v", relinked)
 	}
 }
 
@@ -184,12 +203,17 @@ func TestSplitRejectsInvalidSelection(t *testing.T) {
 		{"duplicate", func(a, b, c, _ string) []string { return []string{c, c} }},
 		{"empty", func(a, b, c, _ string) []string { return nil }},
 		{"malformed", func(a, b, c, _ string) []string { return []string{"nope"} }},
+		{"other workspace", func(a, b, c, o string) []string { return []string{c, o} }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := testdb.New(t)
 			w := seedWorkspace(t, pool)
 			canonical, a, b, c := seedABC(t, pool, w)
-			o := ingest(t, pool, recordInput(w, "O", RecordFacts{LegalName: "Other Co"}))
+			ow := w
+			if tc.name == "other workspace" {
+				ow = seedWorkspace(t, pool)
+			}
+			o := ingest(t, pool, recordInput(ow, "O", RecordFacts{LegalName: "Other Co"}))
 			counts := func() [3]int {
 				return [3]int{countSQL(t, pool, `SELECT count(*) FROM canonical_companies`), countSQL(t, pool, `SELECT count(*) FROM entity_merge_links`), countSQL(t, pool, `SELECT count(*) FROM do_not_merge_pairs`)}
 			}
