@@ -161,7 +161,10 @@ credit_ledger_entries(id bigserial pk, workspace_id fk, bucket_id bigint fk, res
 idempotency_records(workspace_id fk, key text, request_hash bytea not null,
   state text check (in ('in_progress','done')), status_code int, response_body bytea,
   created_at, primary key(workspace_id, key))
-enrichment_runs(id uuid pk, workspace_id fk, buy_box_id fk null, reservation_id fk, candidate_count int,
+enrichment_runs(id uuid pk, workspace_id fk, idempotency_key text not null, buy_box_id fk null,
+  reservation_id fk null,  -- null when nothing billable
+  result jsonb,            -- final RunResult, returned verbatim on replay
+  unique(workspace_id, idempotency_key), candidate_count int,
   hit_count int, zero_hit_count int, failed_count int, status text check (in ('running','completed','failed')), created_at, finished_at)
 source_fetch_cache(provider text, cache_key text, content_hash bytea, payload jsonb null, zero_hit bool,
   fetched_at timestamptz, primary key(provider, cache_key))
