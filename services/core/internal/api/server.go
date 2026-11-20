@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -208,9 +209,13 @@ func mapError(err error) response {
 		resp.headers["WWW-Authenticate"] = "Bearer"
 		return resp
 	case errors.Is(err, ledger.ErrInsufficientCredits):
-		return errorResponse(402, "insufficient_credits", "not enough credits for this request", nil)
+		resp := errorResponse(402, "insufficient_credits", "not enough credits for this request", nil)
+		resp.transient = true // a top-up makes the same request succeed, so never store it
+		return resp
 	case errors.Is(err, ledger.ErrSpendCapExceeded):
-		return errorResponse(403, "spend_cap_exceeded", "monthly spend cap for this API key would be exceeded", nil)
+		resp := errorResponse(403, "spend_cap_exceeded", "monthly spend cap for this API key would be exceeded", nil)
+		resp.transient = true // a raised cap or a new month changes the outcome
+		return resp
 	case errors.Is(err, resolver.ErrInvalidSplit):
 		return errorResponse(422, "invalid_split", "split request cannot be applied", nil)
 	case errors.Is(err, resolver.ErrAlreadyResolved):
@@ -225,6 +230,8 @@ func mapError(err error) response {
 		return errorResponse(409, "idempotency_key_reuse", "Idempotency-Key was already used with a different request", nil)
 	case errors.Is(err, export.ErrUnknownColumn):
 		return errorResponse(400, "invalid_request", "unknown export column", nil)
+	case errors.Is(err, enrich.ErrTooManyCandidates):
+		return errorResponse(400, "invalid_request", fmt.Sprintf("at most %d distinct candidates per request", enrich.MaxCandidates), nil)
 	case errors.Is(err, enrich.ErrInvalidRequest), errors.Is(err, resolver.ErrInvalidRequest),
 		errors.Is(err, ledger.ErrInvalidRequest), errors.Is(err, export.ErrInvalidRequest):
 		return errorResponse(400, "invalid_request", "invalid request", nil)

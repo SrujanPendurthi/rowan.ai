@@ -377,7 +377,44 @@ func TestRunKeyReuseSameCountDifferentPayloadConflicts(t *testing.T) {
 	assertInvariants(t, pool, ws)
 }
 
-func TestRunCanceledSettlesPartial(t *testing.T) {
+// A limiter that cannot grant a second token within runTimeout stops the loop early.
+func TestRunLimiterStopSettlesPartial(t *testing.T) {
+	pool := testdb.New(t)
+	ws := seedWorkspace(t, pool, ledger.Solo)
+	fund(t, pool, ws, 10)
+	cs := cands(4)
+	p := hitProvider(cs, nil, nil)
+	svc := newService(pool, p)
+	svc.Limiter = rate.NewLimiter(rate.Every(time.Hour), 1)
+	res, err := svc.Run(context.Background(), ws, "", "k", "", cs)
+	if err == nil {
+		t.Fatal("want limiter error")
+	}
+	if res.Hits != 1 || res.Unprocessed != 3 || res.Status != "partial" || res.CreditsCommitted != 1 || res.CreditsRefunded != 3 || p.Calls.Load() != 1 {
+		t.Fatalf("RunResult = %+v calls=%d", res, p.Calls.Load())
+	}
+	if sum := res.Hits + res.ZeroHits + res.Failed + res.Cached + res.Unprocessed; sum != len(cs) {
+		t.Fatalf("invariant: counters sum to %d, want %d", sum, len(cs))
+	}
+	if n := scalar[int](t, pool, `SELECT count(*) FROM credit_reservations WHERE status='reserved'`); n != 0 {
+		t.Fatalf("%d reservations still reserved", n)
+	}
+	if st := scalar[string](t, pool, `SELECT status FROM enrichment_runs WHERE id=$1`, res.RunID); st != "partial" {
+		t.Fatalf("run status = %s", st)
+	}
+	if n := scalar[int](t, pool, `SELECT count(*) FROM source_fetch_cache WHERE cache_key=$1 AND NOT zero_hit`, cacheKey(ws, cs[0])); n != 1 {
+		t.Fatal("delivered hit not persisted")
+	}
+	// Replay returns the stored partial result without new lookups.
+	again, err := svc.Run(context.Background(), ws, "", "k", "", cs)
+	if err != nil || again.Status != "partial" || again.Unprocessed != 3 || p.Calls.Load() != 1 {
+		t.Fatalf("replay = %+v, %v", again, err)
+	}
+	assertInvariants(t, pool, ws)
+}
+
+// A client disconnect (canceled request ctx) must not abort a run that holds a reservation.
+func TestRunSurvivesClientCancel(t *testing.T) {
 	pool := testdb.New(t)
 	ws := seedWorkspace(t, pool, ledger.Solo)
 	fund(t, pool, ws, 10)
@@ -391,20 +428,58 @@ func TestRunCanceledSettlesPartial(t *testing.T) {
 		}
 	}
 	res, err := newService(pool, p).Run(ctx, ws, "", "k", "", cs)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
+	if err != nil || res.Status != "completed" || res.Hits != 4 || res.Unprocessed != 0 || res.CreditsCommitted != 4 {
+		t.Fatalf("RunResult = %+v, %v", res, err)
 	}
-	if res.Hits != 1 || res.CreditsCommitted != 1 || res.CreditsRefunded != 3 || p.Calls.Load() != 1 {
+	assertInvariants(t, pool, ws)
+}
+
+func TestRunCandidateCap(t *testing.T) {
+	pool := testdb.New(t)
+	ws := seedWorkspace(t, pool, ledger.Solo)
+	fund(t, pool, ws, 10)
+	big := make([]Candidate, MaxCandidates+1)
+	for i := range big {
+		big[i] = Candidate{Ref: fmt.Sprintf("r%d", i), LegalName: fmt.Sprintf("Co %d", i)}
+	}
+	p := &FakeProvider{}
+	s := newService(pool, p)
+	if _, err := s.Run(context.Background(), ws, "", "k", "", big); !errors.Is(err, ErrTooManyCandidates) || !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("Run err = %v", err)
+	}
+	if _, err := s.Quote(context.Background(), ws, big); !errors.Is(err, ErrTooManyCandidates) {
+		t.Fatalf("Quote err = %v", err)
+	}
+	// Duplicate refs collapse before the cap applies.
+	dups := append(append([]Candidate{}, big[:MaxCandidates]...), big[0])
+	if _, err := s.Quote(context.Background(), ws, dups); err != nil {
+		t.Fatalf("500 distinct + dup: %v", err)
+	}
+	if p.Calls.Load() != 0 || scalar[int](t, pool, `SELECT count(*) FROM enrichment_runs`) != 0 {
+		t.Fatal("rejected request had side effects")
+	}
+}
+
+// Two refs with the same identity cost one lookup and one credit; both are reported.
+func TestRunBillableDedupeByIdentity(t *testing.T) {
+	pool := testdb.New(t)
+	ws := seedWorkspace(t, pool, ledger.Solo)
+	fund(t, pool, ws, 10)
+	a := Candidate{Ref: "a", LegalName: "Zephyr Plumbing LLC", State: "TX"}
+	b := Candidate{Ref: "b", LegalName: "zephyr plumbing llc", State: "tx"}
+	c := Candidate{Ref: "c", LegalName: "Quartz Dental Group", State: "TX"}
+	p := hitProvider([]Candidate{a, c}, nil, nil)
+	s := newService(pool, p)
+	q, err := s.Quote(context.Background(), ws, []Candidate{a, b, c})
+	if err != nil || q.Billable != 2 || q.CreditsRequired != 2 {
+		t.Fatalf("quote = %+v, %v", q, err)
+	}
+	res := mustRun(t, s, ws, "k", "", []Candidate{a, b, c})
+	if p.Calls.Load() != 2 || res.CreditsCommitted != 2 || res.CreditsRefunded != 0 || res.Hits != 3 || res.Unprocessed != 0 {
 		t.Fatalf("RunResult = %+v calls=%d", res, p.Calls.Load())
 	}
-	if n := scalar[int](t, pool, `SELECT count(*) FROM credit_reservations WHERE status='reserved'`); n != 0 {
-		t.Fatalf("%d reservations still reserved", n)
-	}
-	if st := scalar[string](t, pool, `SELECT status FROM enrichment_runs WHERE id=$1`, res.RunID); st != "completed" {
-		t.Fatalf("run status = %s", st)
-	}
-	if n := scalar[int](t, pool, `SELECT count(*) FROM source_fetch_cache WHERE cache_key=$1 AND NOT zero_hit`, cacheKey(ws, cs[0])); n != 1 {
-		t.Fatal("delivered hit not persisted")
+	if len(res.Companies) != 2 {
+		t.Fatalf("companies = %v", res.Companies)
 	}
 	assertInvariants(t, pool, ws)
 }
@@ -585,6 +660,31 @@ func TestRunAllFailedRefundsAll(t *testing.T) {
 	}
 	if st := scalar[string](t, pool, `SELECT status FROM credit_reservations WHERE id=$1`, res.ReservationID); st != "refunded" {
 		t.Fatalf("reservation status = %s", st)
+	}
+	assertInvariants(t, pool, ws)
+}
+
+// If recovery finalized the row while the run was live, finish returns the stored result.
+func TestFinishDoesNotOverwriteFinalizedRun(t *testing.T) {
+	pool := testdb.New(t)
+	ws := seedWorkspace(t, pool, ledger.Solo)
+	fund(t, pool, ws, 10)
+	cs := cands(2)
+	p := hitProvider(cs, nil, nil)
+	p.OnLookup = func(ctx context.Context, c Candidate) {
+		if c.Ref != "c1" {
+			return
+		}
+		if _, err := pool.Exec(ctx, `UPDATE enrichment_runs SET status='failed', result='{"run_id":"x","status":"failed","companies":[]}'`); err != nil {
+			t.Error(err)
+		}
+	}
+	res, err := newService(pool, p).Run(context.Background(), ws, "", "k", "", cs)
+	if err != nil || res.Status != "failed" || res.RunID != "x" {
+		t.Fatalf("res = %+v, %v", res, err)
+	}
+	if st := scalar[string](t, pool, `SELECT status FROM enrichment_runs`); st != "failed" {
+		t.Fatalf("status = %s", st)
 	}
 	assertInvariants(t, pool, ws)
 }

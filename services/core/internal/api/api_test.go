@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"strconv"
 	"strings"
@@ -193,4 +194,65 @@ func TestUnknownFieldRejected(t *testing.T) {
 	wantError(t, e.do("POST", "/v1/enrichment/quote", token, "", `{not json`), 400, "invalid_request")
 	big := `{"candidates":[],"pad":"` + strings.Repeat("x", 1<<20) + `"}`
 	wantError(t, e.do("POST", "/v1/enrichment/quote", token, "", big), 400, "invalid_request")
+}
+
+func TestIdempotencyDoesNotStoreInsufficientCredits(t *testing.T) {
+	e := newEnv(t)
+	ws := e.workspace(ledger.Solo) // unfunded
+	_, token := e.key(ws, 1_000_000, 100)
+	cs := candidates(2)
+	e.provide(cs)
+	wantError(t, e.run(token, "k1", cs, ""), 402, "insufficient_credits")
+	if n := scalar[int](t, e.pool, `SELECT count(*) FROM idempotency_records`); n != 0 {
+		t.Fatalf("402 was stored: %d records", n)
+	}
+	if err := ledger.GrantTopup(t.Context(), e.pool, ws, 10, testNow); err != nil {
+		t.Fatal(err)
+	}
+	rec := e.run(token, "k1", cs, "")
+	wantStatus(t, rec, 200)
+	if rec.Header().Get("Idempotent-Replay") != "" {
+		t.Fatal("stale 402 replayed")
+	}
+	if got := e.available(ws); got != 8 {
+		t.Fatalf("available = %d, want 8 (charged once)", got)
+	}
+	again := e.run(token, "k1", cs, "")
+	if again.Header().Get("Idempotent-Replay") != "true" || e.available(ws) != 8 {
+		t.Fatalf("retry after success must replay without charge")
+	}
+}
+
+func TestIdempotencyDoesNotStoreSpendCap(t *testing.T) {
+	e := newEnv(t)
+	ws := e.workspace(ledger.Solo)
+	e.fund(ws)
+	keyID, token := e.key(ws, 1, 100)
+	cs := candidates(2)
+	e.provide(cs)
+	wantError(t, e.run(token, "k1", cs, ""), 403, "spend_cap_exceeded")
+	if n := scalar[int](t, e.pool, `SELECT count(*) FROM idempotency_records`); n != 0 {
+		t.Fatalf("403 was stored: %d records", n)
+	}
+	if _, err := e.pool.Exec(t.Context(), `UPDATE api_keys SET monthly_spend_cap=1000 WHERE id=$1`, keyID); err != nil {
+		t.Fatal(err)
+	}
+	wantStatus(t, e.run(token, "k1", cs, ""), 200)
+	if got := e.available(ws); got != 498 {
+		t.Fatalf("available = %d, want 498", got)
+	}
+}
+
+func TestRunCandidateCap400(t *testing.T) {
+	e := newEnv(t)
+	_, _, token := e.tenant(ledger.Solo)
+	big := make([]cand, 501)
+	for i := range big {
+		big[i] = cand{"ref": fmt.Sprintf("r%d", i), "legal_name": fmt.Sprintf("Co %d", i)}
+	}
+	body := wantError(t, e.run(token, "k1", big, ""), 400, "invalid_request")
+	if msg := body["error"].(map[string]any)["message"].(string); !strings.Contains(msg, "500") {
+		t.Fatalf("message %q does not name the cap", msg)
+	}
+	wantError(t, e.do("POST", "/v1/enrichment/quote", token, "", cand{"candidates": big}), 400, "invalid_request")
 }

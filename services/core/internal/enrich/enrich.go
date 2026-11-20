@@ -23,7 +23,12 @@ var (
 	ErrInvalidRequest = errors.New("invalid enrichment request")
 	// ErrRunInProgress means another call with the same idempotency key has not finished.
 	ErrRunInProgress = errors.New("enrichment run in progress")
+	// ErrTooManyCandidates is an ErrInvalidRequest: one request may not exceed MaxCandidates distinct refs.
+	ErrTooManyCandidates = fmt.Errorf("too many candidates (max %d): %w", MaxCandidates, ErrInvalidRequest)
 )
+
+// MaxCandidates caps distinct candidate refs per Quote or Run so one request stays inside runTimeout.
+const MaxCandidates = 500
 
 // runTimeout bounds one Run.
 // ponytail: must stay under the 15m ledger.ReleaseStale window, or the sweeper can refund a live reservation.
@@ -56,12 +61,17 @@ type Service struct {
 }
 
 type RunResult struct {
-	RunID            string   `json:"run_id"`
-	ReservationID    string   `json:"reservation_id"`
-	Hits             int      `json:"hits"`
-	ZeroHits         int      `json:"zero_hits"`
-	Failed           int      `json:"failed"`
-	Cached           int      `json:"cached"`
+	RunID         string `json:"run_id"`
+	ReservationID string `json:"reservation_id"`
+	Hits          int    `json:"hits"`
+	ZeroHits      int    `json:"zero_hits"`
+	Failed        int    `json:"failed"`
+	Cached        int    `json:"cached"`
+	// Unprocessed counts candidates never attempted because the run stopped early.
+	// Hits+ZeroHits+Failed+Cached+Unprocessed always equals the deduped candidate count.
+	Unprocessed int `json:"unprocessed"`
+	// Status is "completed", "partial" (stopped early), or "failed" (every lookup failed).
+	Status           string   `json:"status"`
 	CreditsCommitted int64    `json:"credits_committed"`
 	CreditsRefunded  int64    `json:"credits_refunded"`
 	Companies        []string `json:"companies"`
@@ -96,6 +106,9 @@ func dedupe(cs []Candidate) ([]Candidate, error) {
 			out = append(out, c)
 		}
 	}
+	if len(out) > MaxCandidates {
+		return nil, fmt.Errorf("enrich: %d candidates: %w", len(out), ErrTooManyCandidates)
+	}
 	return out, nil
 }
 
@@ -122,12 +135,20 @@ func (s *Service) Quote(ctx context.Context, workspaceID string, cs []Candidate)
 	if err != nil {
 		return Quote{}, err
 	}
+	billable, already := 0, 0
+	for _, g := range groupByIdentity(workspaceID, cs) {
+		if _, ok := cached[g.key]; ok {
+			already += g.n
+		} else {
+			billable++
+		}
+	}
 	available, err := ledger.Available(ctx, s.Pool, workspaceID, now)
 	if err != nil {
 		return Quote{}, err
 	}
 	_, _, overage := ledger.TierSpec(tier)
-	q := Quote{CandidateCount: len(cs), AlreadyEnriched: len(cached), Billable: len(cs) - len(cached), CreditsAvailable: available}
+	q := Quote{CandidateCount: len(cs), AlreadyEnriched: already, Billable: billable, CreditsAvailable: available}
 	q.CreditsRequired = int64(q.Billable)
 	q.Shortfall = max(0, q.CreditsRequired-available)
 	q.OverageEstimateCents = q.Shortfall * overage
@@ -192,7 +213,7 @@ func (s *Service) claimRun(ctx context.Context, workspaceID, idemKey, buyBoxID s
 // recoverAbandoned refunds a dead run's reservation and finalizes its row as failed.
 func (s *Service) recoverAbandoned(ctx context.Context, runID, reservationID string) (RunResult, error) {
 	ctx = context.WithoutCancel(ctx)
-	res := RunResult{RunID: runID, ReservationID: reservationID, Companies: []string{}}
+	res := RunResult{RunID: runID, ReservationID: reservationID, Companies: []string{}, Status: "failed"}
 	if reservationID != "" {
 		_, err := ledger.Settle(ctx, s.Pool, reservationID, 0, s.now())
 		if err != nil && !errors.Is(err, ledger.ErrIdempotencyConflict) {
@@ -247,7 +268,9 @@ func (s *Service) Run(ctx context.Context, workspaceID, apiKeyID, idemKey, buyBo
 			return RunResult{}, fmt.Errorf("enrich: buy box not in workspace: %w", ErrInvalidRequest)
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, runTimeout)
+	// A client disconnect must not abort a run that already holds a reservation; only runTimeout bounds it.
+	// ponytail: a disconnected client learns the outcome by replaying the same Idempotency-Key.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runTimeout)
 	defer cancel()
 	runID, stored, err := s.claimRun(ctx, workspaceID, idemKey, buyBoxID, cs)
 	if err != nil {
@@ -259,23 +282,51 @@ func (s *Service) Run(ctx context.Context, workspaceID, apiKeyID, idemKey, buyBo
 	return s.execute(ctx, workspaceID, apiKeyID, idemKey, runID, cs)
 }
 
+// group is one distinct lookup: the first candidate plus how many refs share its identity.
+type group struct {
+	key string
+	c   Candidate
+	n   int
+}
+
+// groupByIdentity collapses candidates with the same cacheKey so each identity is looked up and billed once.
+func groupByIdentity(workspaceID string, cs []Candidate) []group {
+	idx := map[string]int{}
+	var out []group
+	for _, c := range cs {
+		k := cacheKey(workspaceID, c)
+		if i, ok := idx[k]; ok {
+			out[i].n++
+			continue
+		}
+		idx[k] = len(out)
+		out = append(out, group{key: k, c: c, n: 1})
+	}
+	return out
+}
+
 func (s *Service) execute(ctx context.Context, workspaceID, apiKeyID, idemKey, runID string, cs []Candidate) (RunResult, error) {
 	now := s.now()
-	cached, err := s.freshCache(ctx, cacheKeys(workspaceID, cs), now)
+	groups := groupByIdentity(workspaceID, cs)
+	keys := make([]string, len(groups))
+	for i, g := range groups {
+		keys[i] = g.key
+	}
+	cached, err := s.freshCache(ctx, keys, now)
 	if err != nil {
 		return RunResult{}, errors.Join(err, s.dropRun(ctx, runID))
 	}
-	var billable, hitCached []Candidate
+	var billable, hitCached []group
 	res := RunResult{RunID: runID, Companies: []string{}}
-	for _, c := range cs {
-		row, ok := cached[cacheKey(workspaceID, c)]
+	for _, g := range groups {
+		row, ok := cached[g.key]
 		switch {
 		case !ok:
-			billable = append(billable, c)
+			billable = append(billable, g)
 		case row.zeroHit:
-			res.Cached++
+			res.Cached += g.n
 		default:
-			hitCached = append(hitCached, c)
+			hitCached = append(hitCached, g)
 		}
 	}
 	if len(billable) > 0 {
@@ -301,21 +352,22 @@ func (s *Service) execute(ctx context.Context, workspaceID, apiKeyID, idemKey, r
 		}
 	}
 	var runErr error
-	cachedHits, billableFailed := 0, 0
-	for _, c := range hitCached {
+	// Lookup-level counters drive the ledger; res counters are per ref.
+	lookupHits, lookupFailed, cachedHits := 0, 0, 0
+	for _, g := range hitCached {
 		if runErr = ctx.Err(); runErr != nil {
 			break
 		}
-		ids, err := s.resolveCached(ctx, workspaceID, cached[cacheKey(workspaceID, c)].payload, now)
+		ids, err := s.resolveCached(ctx, workspaceID, cached[g.key].payload, now)
 		if err != nil {
-			res.Failed++
+			res.Failed += g.n
 			continue
 		}
 		add(ids)
-		res.Cached++
+		res.Cached += g.n
 		cachedHits++
 	}
-	for _, c := range billable {
+	for _, g := range billable {
 		if runErr != nil {
 			break
 		}
@@ -328,36 +380,38 @@ func (s *Service) execute(ctx context.Context, workspaceID, apiKeyID, idemKey, r
 				break
 			}
 		}
-		recs, err := s.Provider.Lookup(ctx, c)
+		recs, err := s.Provider.Lookup(ctx, g.c)
 		if err != nil {
 			if runErr = ctx.Err(); runErr != nil {
 				break
 			}
-			res.Failed++
-			billableFailed++
+			res.Failed += g.n
+			lookupFailed++
 			continue
 		}
 		// A delivered answer is persisted even if ctx was canceled during the lookup.
-		ids, err := s.storeLookup(context.WithoutCancel(ctx), workspaceID, cacheKey(workspaceID, c), recs, s.now())
+		ids, err := s.storeLookup(context.WithoutCancel(ctx), workspaceID, g.key, recs, s.now())
 		switch {
 		case err != nil:
-			res.Failed++
-			billableFailed++
+			res.Failed += g.n
+			lookupFailed++
 		case len(recs) == 0:
-			res.ZeroHits++
+			res.ZeroHits += g.n
 		default:
-			res.Hits++
+			res.Hits += g.n
+			lookupHits++
 			add(ids)
 		}
 	}
-	return s.finish(ctx, res, companies, len(billable), billableFailed, cachedHits, runErr)
+	res.Unprocessed = len(cs) - (res.Hits + res.ZeroHits + res.Failed + res.Cached)
+	return s.finish(ctx, res, companies, len(billable), lookupHits, lookupFailed, cachedHits, runErr)
 }
 
 // finish settles credits and finalizes the run row; it runs to completion even when ctx is done.
-func (s *Service) finish(ctx context.Context, res RunResult, companies map[string]struct{}, billable, billableFailed, cachedHits int, runErr error) (RunResult, error) {
+func (s *Service) finish(ctx context.Context, res RunResult, companies map[string]struct{}, billable, lookupHits, billableFailed, cachedHits int, runErr error) (RunResult, error) {
 	ctx = context.WithoutCancel(ctx)
 	if res.ReservationID != "" {
-		settled, err := ledger.Settle(ctx, s.Pool, res.ReservationID, int64(res.Hits), s.now())
+		settled, err := ledger.Settle(ctx, s.Pool, res.ReservationID, int64(lookupHits), s.now())
 		switch {
 		case err == nil:
 			res.CreditsCommitted = settled.CommittedAmount
@@ -373,17 +427,33 @@ func (s *Service) finish(ctx context.Context, res RunResult, companies map[strin
 		res.Companies = append(res.Companies, id)
 	}
 	sort.Strings(res.Companies)
-	status := "completed"
-	if billable > 0 && billableFailed == billable && cachedHits == 0 {
-		status = "failed"
+	res.Status = "completed"
+	switch {
+	case res.Unprocessed > 0 || runErr != nil:
+		res.Status = "partial"
+	case billable > 0 && billableFailed == billable && cachedHits == 0:
+		res.Status = "failed"
 	}
 	raw, err := json.Marshal(res)
 	if err != nil {
 		return res, fmt.Errorf("enrich: marshal result: %w", err)
 	}
-	_, err = s.Pool.Exec(ctx, `UPDATE enrichment_runs SET reservation_id=NULLIF($2,'')::uuid, status=$3,
-		hit_count=$4, zero_hit_count=$5, failed_count=$6, result=$7, finished_at=$8 WHERE id=$1`,
-		res.RunID, res.ReservationID, status, res.Hits, res.ZeroHits, res.Failed, raw, s.now())
+	var id string
+	err = s.Pool.QueryRow(ctx, `UPDATE enrichment_runs SET reservation_id=NULLIF($2,'')::uuid, status=$3,
+		hit_count=$4, zero_hit_count=$5, failed_count=$6, result=$7, finished_at=$8 WHERE id=$1 AND result IS NULL RETURNING id::text`,
+		res.RunID, res.ReservationID, res.Status, res.Hits, res.ZeroHits, res.Failed, raw, s.now()).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Another path (abandoned-run recovery) already finalized the row: its result is authoritative.
+		var stored RunResult
+		var rawStored []byte
+		if err := s.Pool.QueryRow(ctx, `SELECT result FROM enrichment_runs WHERE id=$1`, res.RunID).Scan(&rawStored); err != nil {
+			return res, fmt.Errorf("enrich: load finalized run: %w", err)
+		}
+		if err := json.Unmarshal(rawStored, &stored); err != nil {
+			return res, fmt.Errorf("enrich: decode finalized run: %w", err)
+		}
+		return stored, nil
+	}
 	if err != nil {
 		return res, fmt.Errorf("enrich: finalize run: %w", err)
 	}

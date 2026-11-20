@@ -73,10 +73,12 @@ func (s *server) enrichRun(c *call) (response, error) {
 		resp := mapError(err)
 		// The quote tells the caller exactly how short the workspace is.
 		if q, qerr := s.Enrich.Quote(c.ctx(), c.key.WorkspaceID, cs); qerr == nil {
-			return jsonResponse(402, map[string]any{
+			resp := jsonResponse(402, map[string]any{
 				"error": map[string]string{"code": "insufficient_credits", "message": "not enough credits for this request"},
 				"quote": toQuoteJSON(q),
-			}), nil
+			})
+			resp.transient = true
+			return resp, nil
 		}
 		return resp, nil
 	}
