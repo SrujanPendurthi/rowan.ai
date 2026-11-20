@@ -12,6 +12,7 @@ import (
 
 	"rowan.ai/rowan/services/core/internal/db"
 	"rowan.ai/rowan/services/core/internal/evaluate"
+	"rowan.ai/rowan/services/core/internal/export"
 	"rowan.ai/rowan/services/core/internal/resolver"
 )
 
@@ -136,6 +137,26 @@ func (s *server) evaluations(ctx context.Context, workspaceID, buyBoxID string, 
 	}
 	if out == nil {
 		out = []evaluationJSON{}
+	}
+	tier, err := workspaceTier(ctx, s.Pool, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, len(out))
+	for i, e := range out {
+		ids[i] = e.ID
+	}
+	names, err := export.NameRedactions(ctx, s.Pool, ids, tier)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if names[out[i].ID] {
+			out[i].DisplayName = export.Redacted
+		}
+		if out[i].CriteriaBreakdown, err = redactBreakdown(out[i].CriteriaBreakdown, tier); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }

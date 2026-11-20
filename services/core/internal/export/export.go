@@ -148,6 +148,14 @@ func buildCSV(ctx context.Context, tx pgx.Tx, req Request, tier ledger.Tier) (Re
 	if err != nil {
 		return Result{}, err
 	}
+	ids := make([]string, len(companies))
+	for i, c := range companies {
+		ids[i] = c.id
+	}
+	nameRedacted, err := NameRedactions(ctx, tx, ids, tier)
+	if err != nil {
+		return Result{}, err
+	}
 	var buf bytes.Buffer
 	writer := csv.NewWriter(&buf)
 	header := []string{"canonical_company_id", "display_name", "fit", "overall_score"}
@@ -159,6 +167,10 @@ func buildCSV(ctx context.Context, tx pgx.Tx, req Request, tier ledger.Tier) (Re
 	}
 	redacted := make(map[string]bool)
 	for _, company := range companies {
+		if nameRedacted[company.id] {
+			company.name = Redacted
+			redacted["display_name"] = true
+		}
 		citations, err := loadCitations(ctx, tx, company.id, req.Columns)
 		if err != nil {
 			return Result{}, err
@@ -169,7 +181,7 @@ func buildCSV(ctx context.Context, tx pgx.Tx, req Request, tier ledger.Tier) (Re
 			if best, ok := quality.BestCitation(citations[col]); ok {
 				status, source = string(best.Status), best.SourceSystem+":"+best.SourceRef+"@"+best.RetrievedAt.UTC().Format(time.RFC3339)
 				if !Permitted(best.ExportPolicy, tier) {
-					value = "[REDACTED]"
+					value = Redacted
 					redacted[col] = true
 				} else {
 					value, err = cellValue(best.Value)

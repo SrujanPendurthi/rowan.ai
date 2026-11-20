@@ -280,3 +280,29 @@ func TestExportOrderingAndRedactionSet(t *testing.T) {
 		t.Fatal(result.RedactedFields)
 	}
 }
+
+func TestExportRedactsDisplayNameByLegalNameCitation(t *testing.T) {
+	for _, tc := range []struct {
+		tier     ledger.Tier
+		wantName string
+		wantRed  []string
+	}{
+		{ledger.Solo, "[REDACTED]", []string{"display_name", "revenue_cents"}},
+		{ledger.Fund, "Acme", []string{}},
+	} {
+		f := seed(t, tc.tier)
+		citation(t, f, "legal_name", json.RawMessage(`"Acme"`), quality.VerifiedFiling, quality.FundOnly, exportTime)
+		result, rows, _ := runExport(t, f)
+		if rows[1][1] != tc.wantName {
+			t.Fatalf("%s: display_name = %q, want %q", tc.tier, rows[1][1], tc.wantName)
+		}
+		if !reflect.DeepEqual(result.RedactedFields, tc.wantRed) {
+			t.Fatalf("%s: redacted = %v", tc.tier, result.RedactedFields)
+		}
+	}
+	// No legal_name citation: nothing to gate.
+	f := seed(t, ledger.Solo)
+	if _, rows, _ := runExport(t, f); rows[1][1] != "Acme" {
+		t.Fatalf("ungated name = %q", rows[1][1])
+	}
+}

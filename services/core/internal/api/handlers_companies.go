@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"rowan.ai/rowan/services/core/internal/db"
+	"rowan.ai/rowan/services/core/internal/export"
 	"rowan.ai/rowan/services/core/internal/quality"
 	"rowan.ai/rowan/services/core/internal/resolver"
 )
@@ -81,6 +82,20 @@ func (s *server) getCompany(c *call) (response, error) {
 	})
 	if err != nil {
 		return response{}, fmt.Errorf("list links: %w", err)
+	}
+	tier, err := workspaceTier(c.ctx(), tx, c.key.WorkspaceID)
+	if err != nil {
+		return response{}, err
+	}
+	for i := range out.Citations {
+		redactCitation(&out.Citations[i], tier)
+	}
+	names, err := export.NameRedactions(c.ctx(), tx, []string{id}, tier)
+	if err != nil {
+		return response{}, err
+	}
+	if names[id] {
+		out.DisplayName = export.Redacted
 	}
 	if out.Citations == nil {
 		out.Citations = []quality.Citation{}
