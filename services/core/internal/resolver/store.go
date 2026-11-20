@@ -110,7 +110,10 @@ func Resolve(ctx context.Context, tx pgx.Tx, in SourceRecordInput, now time.Time
 	if err != nil {
 		return ResolveResult{}, fmt.Errorf("marshal source payload: %w", err)
 	}
-	hash := sha256.Sum256(payload)
+	hash, err := contentHash(payload, in.Citations)
+	if err != nil {
+		return ResolveResult{}, err
+	}
 	if err := LockWorkspace(ctx, tx, in.WorkspaceID); err != nil {
 		return ResolveResult{}, err
 	}
@@ -127,10 +130,10 @@ func Resolve(ctx context.Context, tx pgx.Tx, in SourceRecordInput, now time.Time
 		if err != nil {
 			return ResolveResult{}, err
 		}
-		if linked && bytes.Equal(oldHash, hash[:]) {
+		if linked && bytes.Equal(oldHash, hash) {
 			return result, nil
 		}
-		if _, err := tx.Exec(ctx, `UPDATE source_records SET payload=$2,content_hash=$3,fetched_at=$4 WHERE id=$1`, recordID, payload, hash[:], in.FetchedAt); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE source_records SET payload=$2,content_hash=$3,fetched_at=$4 WHERE id=$1`, recordID, payload, hash, in.FetchedAt); err != nil {
 			return ResolveResult{}, fmt.Errorf("update source record: %w", err)
 		}
 		if linked {
@@ -145,12 +148,26 @@ func Resolve(ctx context.Context, tx pgx.Tx, in SourceRecordInput, now time.Time
 	} else {
 		err := tx.QueryRow(ctx, `INSERT INTO source_records(workspace_id,source_system,external_ref,payload,content_hash,fetched_at)
 			VALUES ($1,$2,$3,$4,$5,$6) RETURNING id::text`,
-			in.WorkspaceID, in.SourceSystem, in.ExternalRef, payload, hash[:], in.FetchedAt).Scan(&recordID)
+			in.WorkspaceID, in.SourceSystem, in.ExternalRef, payload, hash, in.FetchedAt).Scan(&recordID)
 		if err != nil {
 			return ResolveResult{}, fmt.Errorf("insert source record: %w", err)
 		}
 	}
 	return resolveNewRecord(ctx, tx, in, recordID, keys, now)
+}
+
+// contentHash covers citations as well as the payload: a citation-only change (e.g. commercial_estimate ->
+// verified_filing) must count as new content so citations are replaced and evaluations re-run.
+func contentHash(payload []byte, citations []quality.Citation) ([]byte, error) {
+	b, err := json.Marshal(struct {
+		Payload   json.RawMessage    `json:"payload"`
+		Citations []quality.Citation `json:"citations"`
+	}{payload, citations})
+	if err != nil {
+		return nil, fmt.Errorf("marshal source hash input: %w", err)
+	}
+	sum := sha256.Sum256(b)
+	return sum[:], nil
 }
 
 func existingLink(ctx context.Context, tx pgx.Tx, recordID string) (ResolveResult, bool, error) {

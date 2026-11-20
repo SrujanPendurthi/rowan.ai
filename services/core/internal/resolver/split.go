@@ -98,6 +98,12 @@ func Split(ctx context.Context, tx pgx.Tx, canonicalID string, sourceRecordIDs [
 		if err := refreshDisplayName(ctx, tx, id, now); err != nil {
 			return "", err
 		}
+		// Moved records may carry pending review candidates; each side's flag follows its own records.
+		if _, err := tx.Exec(ctx, `UPDATE canonical_companies SET pending_review = EXISTS (
+			SELECT 1 FROM possible_match_candidates p JOIN entity_merge_links l ON l.source_record_id=p.source_record_id
+			WHERE l.canonical_company_id=$1 AND l.status='active' AND p.status='pending') WHERE id=$1`, id); err != nil {
+			return "", fmt.Errorf("refresh split pending review: %w", err)
+		}
 		if err := evaluate.ReevaluateCompany(ctx, tx, id, now); err != nil {
 			return "", fmt.Errorf("reevaluate split company: %w", err)
 		}

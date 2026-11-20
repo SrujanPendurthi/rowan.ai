@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
@@ -194,5 +195,43 @@ func TestResolveReviewRechecksDoNotMerge(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// A citation-only change (same facts) must replace citations and re-run evaluations.
+func TestResolveReingestChangedCitationReevaluates(t *testing.T) {
+	pool := testdb.New(t)
+	w := seedWorkspace(t, pool)
+	box := seedID(t, pool, `INSERT INTO buy_boxes(workspace_id,name,criteria) VALUES ($1,'b','{"revenue_min_cents":20}') RETURNING id::text`, w)
+	in := recordInput(w, "A", RecordFacts{LegalName: "Acme A"})
+	in.Citations = []quality.Citation{fieldCitation("revenue_cents", `30`, quality.CommercialEstimate)}
+	first := ingest(t, pool, in)
+	status := func() string {
+		var raw []byte
+		if err := pool.QueryRow(context.Background(), `SELECT criteria_breakdown FROM buy_box_evaluations WHERE buy_box_id=$1 AND canonical_company_id=$2`, box, first.CanonicalID).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var rs []struct{ Status string }
+		if err := json.Unmarshal(raw, &rs); err != nil || len(rs) != 1 {
+			t.Fatalf("bad breakdown %s %v", raw, err)
+		}
+		return rs[0].Status
+	}
+	if got := status(); got != "UNVERIFIED_LOW_CONFIDENCE" {
+		t.Fatalf("before: %s", got)
+	}
+	in.Citations = []quality.Citation{fieldCitation("revenue_cents", `30`, quality.VerifiedFiling)}
+	again := ingest(t, pool, in)
+	if again.CanonicalID != first.CanonicalID {
+		t.Fatalf("canonical changed: %+v", again)
+	}
+	if got := status(); got != "MET" {
+		t.Fatalf("after citation upgrade: %s", got)
+	}
+	if n := countSQL(t, pool, `SELECT count(*) FROM field_citations WHERE canonical_company_id=$1 AND field_name='revenue_cents' AND data_quality_status='verified_filing'`, first.CanonicalID); n != 1 {
+		t.Fatalf("citations not replaced: %d", n)
+	}
+	if n := countSQL(t, pool, `SELECT count(*) FROM field_citations WHERE canonical_company_id=$1 AND field_name='revenue_cents'`, first.CanonicalID); n != 1 {
+		t.Fatalf("stale citation kept: %d", n)
 	}
 }

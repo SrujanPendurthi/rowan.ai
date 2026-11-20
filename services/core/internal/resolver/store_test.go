@@ -2,7 +2,6 @@ package resolver
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -274,8 +273,11 @@ func TestResolvePayloadAndDisplayName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hash := sha256.Sum256(expected)
-	if n := countSQL(t, pool, `SELECT count(*) FROM source_records WHERE id=$1 AND payload=$2::jsonb AND content_hash=$3`, result.SourceRecordID, expected, hash[:]); n != 1 {
+	hash, err := contentHash(expected, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countSQL(t, pool, `SELECT count(*) FROM source_records WHERE id=$1 AND payload=$2::jsonb AND content_hash=$3`, result.SourceRecordID, expected, hash); n != 1 {
 		t.Fatal("payload or content hash mismatch")
 	}
 	if n := countSQL(t, pool, `SELECT count(*) FROM canonical_companies WHERE id=$1 AND display_name='Acme LLC'`, result.CanonicalID); n != 1 {

@@ -240,3 +240,29 @@ func TestSplitRejectsInvalidSelection(t *testing.T) {
 		}
 	})
 }
+
+func TestSplitRecomputesPendingReview(t *testing.T) {
+	for _, movePending := range []bool{true, false} {
+		pool := testdb.New(t)
+		w := seedWorkspace(t, pool)
+		first, second, _ := seedReview(t, pool, w)
+		// Fold the review-band record into the first canonical, keeping its pending candidate.
+		execSQL(t, pool, `UPDATE entity_merge_links SET canonical_company_id=$1 WHERE source_record_id=$2`, first.CanonicalID, second.SourceRecordID)
+		execSQL(t, pool, `UPDATE field_citations SET canonical_company_id=$1 WHERE source_record_id=$2`, first.CanonicalID, second.SourceRecordID)
+		execSQL(t, pool, `UPDATE canonical_companies SET pending_review=true WHERE id=$1`, first.CanonicalID)
+		moved := first.SourceRecordID
+		if movePending {
+			moved = second.SourceRecordID
+		}
+		newID, err := split(t, pool, first.CanonicalID, []string{moved})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending := func(id string) bool {
+			return countSQL(t, pool, `SELECT count(*) FROM canonical_companies WHERE id=$1 AND pending_review`, id) == 1
+		}
+		if pending(newID) != movePending || pending(first.CanonicalID) != !movePending {
+			t.Fatalf("movePending=%v: new pending=%v original pending=%v", movePending, pending(newID), pending(first.CanonicalID))
+		}
+	}
+}
