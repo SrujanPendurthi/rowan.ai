@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"rowan.ai/rowan/services/core/internal/db"
@@ -72,7 +73,7 @@ func GrantPeriod(ctx context.Context, pool *pgxpool.Pool, workspaceID string, pe
 		return grant(ctx, tx, workspaceID, "included", included, periodStart, periodStart.AddDate(0, 0, days), periodDate)
 	})
 	if err != nil {
-		return fmt.Errorf("ledger: grant period: %w", err)
+		return fmt.Errorf("ledger: grant period: %w", invalidRequestError(err))
 	}
 	return nil
 }
@@ -84,11 +85,28 @@ func GrantTopup(ctx context.Context, pool *pgxpool.Pool, workspaceID string, cre
 	}
 	at = at.UTC()
 	if err := db.InTx(ctx, pool, func(tx pgx.Tx) error {
+		if err := requireWorkspace(ctx, tx, workspaceID); err != nil {
+			return err
+		}
 		return grant(ctx, tx, workspaceID, "topup", credits, at, at.AddDate(0, 0, 365), nil)
 	}); err != nil {
-		return fmt.Errorf("ledger: grant topup: %w", err)
+		return fmt.Errorf("ledger: grant topup: %w", invalidRequestError(err))
 	}
 	return nil
+}
+
+// invalidRequestError classifies missing identities and malformed UUID input.
+func invalidRequestError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.Is(err, pgx.ErrNoRows) || (errors.As(err, &pgErr) && pgErr.Code == "22P02") {
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+	}
+	return err
+}
+
+func requireWorkspace(ctx context.Context, tx pgx.Tx, workspaceID string) error {
+	var id string
+	return tx.QueryRow(ctx, `SELECT id::text FROM workspaces WHERE id=$1 FOR KEY SHARE`, workspaceID).Scan(&id)
 }
 
 func grant(ctx context.Context, tx pgx.Tx, workspaceID, kind string, credits int64, at, expires time.Time, period any) error {
@@ -131,11 +149,16 @@ func Reserve(ctx context.Context, pool *pgxpool.Pool, req ReserveRequest, now ti
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
+		if err := requireWorkspace(ctx, tx, req.WorkspaceID); err != nil {
+			return err
+		}
 		if req.APIKeyID != "" {
 			if err := checkSpendCap(ctx, tx, req, now); err != nil {
 				return err
 			}
 		}
+		// ponytail: Lock all live buckets so reserves in one workspace serialize.
+		// If throughput matters, upgrade to a workspace allocator with narrower lot locks.
 		buckets, err := lockBuckets(ctx, tx, req.WorkspaceID, now)
 		if err != nil {
 			return err
@@ -180,7 +203,7 @@ func Reserve(ctx context.Context, pool *pgxpool.Pool, req ReserveRequest, now ti
 			return Reservation{}, fmt.Errorf("ledger: reserve: %w", replayErr)
 		}
 	}
-	return Reservation{}, fmt.Errorf("ledger: reserve: %w", err)
+	return Reservation{}, fmt.Errorf("ledger: reserve: %w", invalidRequestError(err))
 }
 
 func checkSpendCap(ctx context.Context, tx pgx.Tx, req ReserveRequest, now time.Time) error {

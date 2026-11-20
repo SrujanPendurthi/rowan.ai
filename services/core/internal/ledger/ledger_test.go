@@ -145,6 +145,25 @@ func TestReserveFIFOOrder(t *testing.T) {
 	countRows(t, pool, `SELECT count(*) FROM credit_ledger_entries WHERE reservation_id=$1 AND entry_type='reserve' AND created_at=$2 AND ((bucket_id=$3 AND amount=50) OR (bucket_id=$4 AND amount=70))`, 2, got.ID, testNow, rollover, included)
 }
 
+func TestReserveTypePriorityBeatsExpiry(t *testing.T) {
+	pool := testdb.New(t)
+	workspace := seedWorkspace(t, pool, Solo)
+	topup := seedBucket(t, pool, workspace, "topup", 100, testNow.AddDate(0, 0, 10))
+	included := seedBucket(t, pool, workspace, "included", 50, testNow.AddDate(0, 0, 20))
+	rollover := seedBucket(t, pool, workspace, "rollover", 25, testNow.AddDate(0, 0, 30))
+	for i, want := range [][3]int64{{5, 50, 100}, {0, 30, 100}, {0, 0, 90}} {
+		amount := []int64{20, 25, 40}[i]
+		if _, err := Reserve(context.Background(), pool, ReserveRequest{
+			WorkspaceID: workspace, IdempotencyKey: fmt.Sprintf("type-priority-%d", i), Amount: amount,
+		}, testNow); err != nil {
+			t.Fatal(err)
+		}
+		bucketBalance(t, pool, rollover, want[0])
+		bucketBalance(t, pool, included, want[1])
+		bucketBalance(t, pool, topup, want[2])
+	}
+}
+
 func TestReserveFIFOExpiryAndID(t *testing.T) {
 	pool := testdb.New(t)
 	workspace := seedWorkspace(t, pool, Solo)
@@ -458,19 +477,40 @@ func TestReserveRejectsInvalidInput(t *testing.T) {
 	other := seedWorkspace(t, pool, Solo)
 	key := seedAPIKey(t, pool, other, 100)
 	for _, req := range []ReserveRequest{
+		{IdempotencyKey: "empty-workspace", Amount: 1},
+		{WorkspaceID: "00000000-0000-0000-0000-000000000000", IdempotencyKey: "missing-workspace", Amount: 1},
+		{WorkspaceID: "invalid-uuid", IdempotencyKey: "malformed-workspace", Amount: 1},
+		{WorkspaceID: workspace, APIKeyID: "00000000-0000-0000-0000-000000000000", IdempotencyKey: "missing-key", Amount: 1},
+		{WorkspaceID: workspace, APIKeyID: "invalid-uuid", IdempotencyKey: "malformed-key", Amount: 1},
 		{WorkspaceID: workspace, IdempotencyKey: "zero", Amount: 0},
 		{WorkspaceID: workspace, IdempotencyKey: "negative", Amount: -1},
 		{WorkspaceID: workspace, Amount: 1},
 		{WorkspaceID: workspace, APIKeyID: key, IdempotencyKey: "foreign-key", Amount: 1},
 	} {
-		if _, err := Reserve(context.Background(), pool, req, testNow); err == nil {
-			t.Fatalf("accepted invalid request: %+v", req)
+		if _, err := Reserve(context.Background(), pool, req, testNow); !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("request %+v: error = %v, want ErrInvalidRequest", req, err)
 		}
 	}
 	if err := GrantTopup(context.Background(), pool, workspace, 0, testNow); err == nil {
 		t.Fatal("accepted zero topup")
 	}
 	countRows(t, pool, `SELECT count(*) FROM credit_reservations`, 0)
+	countRows(t, pool, `SELECT count(*) FROM credit_ledger_entries`, 0)
+}
+
+func TestGrantsRejectInvalidWorkspace(t *testing.T) {
+	pool := testdb.New(t)
+	for _, workspace := range []string{"", "invalid-uuid", "00000000-0000-0000-0000-000000000000"} {
+		t.Run(workspace, func(t *testing.T) {
+			if err := GrantPeriod(context.Background(), pool, workspace, testNow); !errors.Is(err, ErrInvalidRequest) {
+				t.Errorf("GrantPeriod error = %v, want ErrInvalidRequest", err)
+			}
+			if err := GrantTopup(context.Background(), pool, workspace, 10, testNow); !errors.Is(err, ErrInvalidRequest) {
+				t.Errorf("GrantTopup error = %v, want ErrInvalidRequest", err)
+			}
+		})
+	}
+	countRows(t, pool, `SELECT count(*) FROM credit_buckets`, 0)
 	countRows(t, pool, `SELECT count(*) FROM credit_ledger_entries`, 0)
 }
 
