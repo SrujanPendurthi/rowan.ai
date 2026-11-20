@@ -1,2 +1,8 @@
 .superpowers/
 .DS_Store
+
+# Local configuration and Go build artifacts.
+.env
+bin/
+coverage.out
+*.test
