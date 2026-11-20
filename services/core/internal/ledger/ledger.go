@@ -1,10 +1,11 @@
-// Package ledger grants and reserves credits in transactional FIFO lots.
+// Package ledger grants, reserves, settles, and expires credits in transactional FIFO lots.
 package ledger
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -295,4 +296,182 @@ func Available(ctx context.Context, pool *pgxpool.Pool, workspaceID string, now 
 		return 0, fmt.Errorf("ledger: available: %w", err)
 	}
 	return available, nil
+}
+
+// Settle commits used credits and refunds the remainder to the original lots.
+// The reservation ID identifies an idempotent settlement; changing used conflicts.
+func Settle(ctx context.Context, pool *pgxpool.Pool, reservationID string, used int64, now time.Time) (Reservation, error) {
+	result, _, err := settle(ctx, pool, reservationID, used, now)
+	return result, err
+}
+
+// settle also reports whether this call changed a reserved reservation.
+func settle(ctx context.Context, pool *pgxpool.Pool, reservationID string, used int64, now time.Time) (Reservation, bool, error) {
+	if used < 0 {
+		return Reservation{}, false, fmt.Errorf("ledger: settle: %w", ErrInvalidRequest)
+	}
+	now = now.UTC()
+	var result Reservation
+	changed := false
+	err := db.InTx(ctx, pool, func(tx pgx.Tx) error {
+		var workspace string
+		if err := tx.QueryRow(ctx, `SELECT id::text, workspace_id::text, amount, committed_amount, status
+			FROM credit_reservations WHERE id=$1 FOR UPDATE`, reservationID).
+			Scan(&result.ID, &workspace, &result.Amount, &result.CommittedAmount, &result.Status); err != nil {
+			return err
+		}
+		if used > result.Amount {
+			return ErrInvalidRequest
+		}
+		if result.Status != "reserved" {
+			if (result.Status == "committed" && result.CommittedAmount == used) || (result.Status == "refunded" && used == 0) {
+				return nil
+			}
+			return ErrIdempotencyConflict
+		}
+		// Match Reserve and ExpireDue's bucket lock order, independent of FIFO order.
+		rows, err := tx.Query(ctx, `SELECT id FROM credit_buckets WHERE id IN
+			(SELECT bucket_id FROM credit_ledger_entries WHERE reservation_id=$1 AND entry_type='reserve')
+			ORDER BY id FOR UPDATE`, reservationID)
+		if err != nil {
+			return err
+		}
+		if _, err := pgx.CollectRows(rows, pgx.RowTo[int64]); err != nil {
+			return err
+		}
+		rows, err = tx.Query(ctx, `SELECT bucket_id, amount FROM credit_ledger_entries
+			WHERE reservation_id=$1 AND entry_type='reserve' ORDER BY id`, reservationID)
+		if err != nil {
+			return err
+		}
+		type allocation struct{ bucketID, amount int64 }
+		lots, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (allocation, error) {
+			var lot allocation
+			err := row.Scan(&lot.bucketID, &lot.amount)
+			return lot, err
+		})
+		if err != nil {
+			return err
+		}
+		remaining := used
+		for _, lot := range lots {
+			if remaining == 0 {
+				break
+			}
+			amount := min(remaining, lot.amount)
+			if err := settlementEntry(ctx, tx, workspace, reservationID, lot.bucketID, "commit", amount, now); err != nil {
+				return err
+			}
+			remaining -= amount
+		}
+		remaining = result.Amount - used
+		for i := len(lots) - 1; i >= 0 && remaining > 0; i-- {
+			lot := lots[i]
+			amount := min(remaining, lot.amount)
+			// Refunds return to the source lot even when it has expired.
+			if _, err := tx.Exec(ctx, `UPDATE credit_buckets SET balance_remaining=balance_remaining+$2 WHERE id=$1`, lot.bucketID, amount); err != nil {
+				return err
+			}
+			if err := settlementEntry(ctx, tx, workspace, reservationID, lot.bucketID, "refund", amount, now); err != nil {
+				return err
+			}
+			remaining -= amount
+		}
+		result.Status, result.CommittedAmount = "committed", used
+		if used == 0 {
+			result.Status = "refunded"
+		}
+		_, err = tx.Exec(ctx, `UPDATE credit_reservations SET status=$2, committed_amount=$3, settled_at=$4 WHERE id=$1`, reservationID, result.Status, used, now)
+		changed = err == nil
+		return err
+	})
+	if err != nil {
+		return Reservation{}, false, fmt.Errorf("ledger: settle: %w", invalidRequestError(err))
+	}
+	return result, changed, nil
+}
+
+func settlementEntry(ctx context.Context, tx pgx.Tx, workspace, reservation string, bucketID int64, kind string, amount int64, now time.Time) error {
+	_, err := tx.Exec(ctx, `INSERT INTO credit_ledger_entries
+		(workspace_id, bucket_id, reservation_id, entry_type, amount, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6)`, workspace, bucketID, reservation, kind, amount, now)
+	return err
+}
+
+// Refund returns all reserved credits to their source lots.
+func Refund(ctx context.Context, pool *pgxpool.Pool, reservationID string, now time.Time) (Reservation, error) {
+	return Settle(ctx, pool, reservationID, 0, now)
+}
+
+// ExpireDue removes and journals the remaining credits in all due lots.
+// Repeated sweeps write nothing until an expired lot receives another refund.
+func ExpireDue(ctx context.Context, pool *pgxpool.Pool, now time.Time) (expired int64, err error) {
+	now = now.UTC()
+	err = db.InTx(ctx, pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id, workspace_id::text, balance_remaining FROM credit_buckets
+			WHERE expires_at<=$1 AND balance_remaining>0 ORDER BY id FOR UPDATE`, now)
+		if err != nil {
+			return err
+		}
+		type dueLot struct {
+			id, balance int64
+			workspace   string
+		}
+		lots, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (dueLot, error) {
+			var lot dueLot
+			err := row.Scan(&lot.id, &lot.workspace, &lot.balance)
+			return lot, err
+		})
+		if err != nil {
+			return err
+		}
+		for _, lot := range lots {
+			if lot.balance > math.MaxInt64-expired {
+				return fmt.Errorf("expired credit total exceeds int64")
+			}
+			if _, err := tx.Exec(ctx, `UPDATE credit_buckets SET balance_remaining=0 WHERE id=$1`, lot.id); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO credit_ledger_entries
+				(workspace_id, bucket_id, entry_type, amount, created_at)
+				VALUES ($1,$2,'expire',$3,$4)`, lot.workspace, lot.id, lot.balance, now); err != nil {
+				return err
+			}
+			expired += lot.balance
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("ledger: expire due: %w", err)
+	}
+	return expired, nil
+}
+
+// ReleaseStale refunds reservations strictly older than the cutoff in separate transactions.
+// It counts only transitions performed by this call, excluding concurrent replays.
+func ReleaseStale(ctx context.Context, pool *pgxpool.Pool, olderThan time.Duration, now time.Time) (released int, err error) {
+	rows, err := pool.Query(ctx, `SELECT id::text FROM credit_reservations
+		WHERE status='reserved' AND created_at<$1 ORDER BY created_at, id`, now.Add(-olderThan))
+	if err != nil {
+		return 0, fmt.Errorf("ledger: release stale: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return 0, fmt.Errorf("ledger: release stale: %w", err)
+	}
+	// ponytail: Materializing all stale IDs and settling serially limits sweep throughput.
+	// Large backlogs should use bounded batches while retaining one transaction per reservation.
+	for _, id := range ids {
+		_, changed, err := settle(ctx, pool, id, 0, now)
+		if errors.Is(err, ErrIdempotencyConflict) {
+			continue
+		}
+		if err != nil {
+			return released, fmt.Errorf("ledger: release stale reservation %s: %w", id, err)
+		}
+		if changed {
+			released++
+		}
+	}
+	return released, nil
 }

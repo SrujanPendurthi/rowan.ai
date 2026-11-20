@@ -285,6 +285,7 @@ func TestReserveSameKeyConcurrent(t *testing.T) {
 			bucketBalance(t, pool, id, balance-10)
 			countRows(t, pool, `SELECT count(*) FROM credit_reservations`, 1)
 			countRows(t, pool, `SELECT count(*) FROM credit_ledger_entries`, 1)
+			assertInvariants(t, pool, workspace)
 		})
 	}
 }
@@ -315,6 +316,7 @@ func TestReserveConcurrentNoOverdraft(t *testing.T) {
 	bucketBalance(t, pool, id, 0)
 	countRows(t, pool, `SELECT count(*) FROM credit_reservations`, 10)
 	countRows(t, pool, `SELECT count(*) FROM credit_ledger_entries`, 10)
+	assertInvariants(t, pool, workspace)
 }
 
 func TestSpendCapExceeded(t *testing.T) {
