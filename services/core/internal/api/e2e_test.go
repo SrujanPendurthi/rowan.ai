@@ -1,12 +1,15 @@
 package api
 
 import (
+	"context"
 	"fmt"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"rowan.ai/rowan/services/core/internal/enrich"
 	"rowan.ai/rowan/services/core/internal/ledger"
 	"rowan.ai/rowan/services/core/internal/quality"
 	"rowan.ai/rowan/services/core/internal/resolver"
@@ -92,17 +95,28 @@ func TestE2ESourcingLoop(t *testing.T) {
 		Facts:     resolver.RecordFacts{LegalName: "Quartz Dental Group", State: "OH"},
 		Citations: ohCitations(`300000000`, quality.CommercialEstimate)}}
 
-	// Quote is free.
+	// Quote is free: no row appears in or changes across the credit tables.
+	creditCounts := func() [3]int {
+		var n [3]int
+		for i, tbl := range []string{"credit_buckets", "credit_ledger_entries", "credit_reservations"} {
+			n[i] = scalar[int](t, e.pool, `SELECT count(*) FROM `+tbl)
+		}
+		return n
+	}
+	bucketSum := func() int64 {
+		return scalar[int64](t, e.pool, `SELECT COALESCE(sum(balance_remaining),0)::bigint FROM credit_buckets`)
+	}
+	beforeCounts, beforeBalance := creditCounts(), bucketSum()
 	rec = e.do("POST", "/v1/enrichment/quote", token, "", cand{"candidates": cs})
 	wantStatus(t, rec, 200)
 	if q := decode(t, rec); q["credits_required"] != 4.0 || q["billable"] != 4.0 {
 		t.Fatalf("quote = %v", q)
 	}
+	if after := creditCounts(); after != beforeCounts || bucketSum() != beforeBalance {
+		t.Fatalf("quote changed credit tables: counts %v -> %v, balance %d -> %d", beforeCounts, after, beforeBalance, bucketSum())
+	}
 	if e.available(ws) != 500 {
 		t.Fatal("quote changed credits")
-	}
-	if n := scalar[int](t, e.pool, `SELECT count(*) FROM credit_reservations`); n != 0 {
-		t.Fatalf("quote wrote %d reservations", n)
 	}
 
 	// Run: 3 hits committed, zero-hit cand-4 refunded.
@@ -148,6 +162,10 @@ func TestE2ESourcingLoop(t *testing.T) {
 	wantStatus(t, rec, 200)
 	if decode(t, rec)["status"] != "rejected" {
 		t.Fatalf("resolve = %s", rec.Body.String())
+	}
+	// Reject pairs the DBA record with each active record of cand-1's company (sam + irs).
+	if n := scalar[int](t, e.pool, `SELECT count(*) FROM do_not_merge_pairs WHERE reason='review_rejected'`); n != 2 {
+		t.Fatalf("review_rejected do_not_merge_pairs = %d, want 2", n)
 	}
 	rec = e.do("GET", "/v1/review-queue", token, "", nil)
 	if q := sub[[]any](t, decode(t, rec), "candidates"); len(q) != 0 {
@@ -197,8 +215,10 @@ func TestE2ESourcingLoop(t *testing.T) {
 	}
 	csv := rec.Body.String()
 	header := strings.SplitN(csv, "\n", 2)[0]
-	if !strings.Contains(csv, "[REDACTED]") || strings.Contains(csv, "250000000") ||
-		!strings.Contains(header, "revenue_cents__data_quality_status") || !strings.Contains(csv, "verified_filing") {
+	// cand-3's estimate carries deal_team_plus policy: redacted on solo, quality status still exported.
+	if !strings.Contains(csv, "[REDACTED]") || strings.Contains(csv, "250000000") || strings.Contains(csv, "300000000") ||
+		!strings.Contains(header, "revenue_cents__data_quality_status") || !strings.Contains(csv, "verified_filing") ||
+		!strings.Contains(csv, "commercial_estimate") {
 		t.Fatalf("csv = %s", csv)
 	}
 	if n := scalar[int](t, e.pool, `SELECT count(*) FROM export_audits WHERE workspace_id=$1 AND user_or_key_id=$2`, ws, "api_key:"+keyID); n != 1 {
@@ -227,36 +247,45 @@ func TestE2ELedgerIntegrity(t *testing.T) {
 		}}
 	}
 
-	type outcome struct {
-		key    int
-		status int
-		code   string
-	}
-	results := make(chan outcome, keys*retries)
+	// Hold every lookup so concurrent retries of one key overlap the in-flight run.
+	e.provider.OnLookup = func(context.Context, enrich.Candidate) { time.Sleep(50 * time.Millisecond) }
+
+	// Start barrier: all goroutines block until every one is spawned.
+	start := make(chan struct{})
+	recs := make([]*httptest.ResponseRecorder, keys*retries)
 	var wg sync.WaitGroup
 	for k := range keys {
-		for range retries {
+		for r := range retries {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				rec := e.do("POST", "/v1/enrichment/run", token, fmt.Sprintf("ledger-key-%d", k), bodies[k])
-				code := ""
-				if rec.Code != 200 {
-					if m := decode(t, rec); m["error"] != nil {
-						code, _ = m["error"].(map[string]any)["code"].(string)
-					}
-				}
-				results <- outcome{k, rec.Code, code}
+				<-start
+				recs[k*retries+r] = e.do("POST", "/v1/enrichment/run", token, fmt.Sprintf("ledger-key-%d", k), bodies[k])
 			}()
 		}
 	}
+	close(start)
 	wg.Wait()
-	close(results)
-	for r := range results {
-		if r.status != 200 && !(r.status == 409 && r.code == "request_in_progress") {
-			t.Fatalf("key %d: status %d code %q, want 200 or 409 request_in_progress", r.key, r.status, r.code)
+
+	inProgress := 0
+	for i, rec := range recs {
+		switch rec.Code {
+		case 200:
+		case 409:
+			errBody, _ := decode(t, rec)["error"].(map[string]any)
+			if errBody["code"] != "request_in_progress" {
+				t.Fatalf("key %d: 409 body %s, want request_in_progress", i/retries, rec.Body.String())
+			}
+			inProgress++
+		default:
+			t.Fatalf("key %d: status %d body %s, want 200 or 409 request_in_progress", i/retries, rec.Code, rec.Body.String())
 		}
 	}
+	if inProgress == 0 {
+		t.Fatal("no 409 request_in_progress observed: retries never overlapped an in-flight run")
+	}
+	e.provider.OnLookup = nil
+
 	// A settled retry replays the stored result for every key.
 	for k := range keys {
 		rec := e.do("POST", "/v1/enrichment/run", token, fmt.Sprintf("ledger-key-%d", k), bodies[k])
@@ -266,16 +295,46 @@ func TestE2ELedgerIntegrity(t *testing.T) {
 		}
 	}
 
-	// Exactly one reservation per key, each committed once with the zero-hit refunded.
-	if n := scalar[int](t, e.pool, `SELECT count(*) FROM credit_reservations WHERE workspace_id=$1`, ws); n != keys {
-		t.Fatalf("reservations = %d, want %d", n, keys)
+	// Exactly one reservation per idempotency key, sized to that key's billable count, committed once.
+	rows, err := e.pool.Query(t.Context(), `SELECT idempotency_key, count(*), sum(amount)::bigint, sum(committed_amount)::bigint
+		FROM credit_reservations WHERE workspace_id=$1 GROUP BY idempotency_key`, ws)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if n := scalar[int](t, e.pool, `SELECT count(*) FROM credit_reservations WHERE workspace_id=$1
-		AND status='committed' AND amount=2 AND committed_amount=1`, ws); n != keys {
+	perKey := map[string][3]int64{}
+	for rows.Next() {
+		var key string
+		var n, amount, committed int64
+		if err := rows.Scan(&key, &n, &amount, &committed); err != nil {
+			t.Fatal(err)
+		}
+		perKey[key] = [3]int64{n, amount, committed}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(perKey) != keys {
+		t.Fatalf("reservation keys = %v, want %d", perKey, keys)
+	}
+	for k := range keys {
+		want := [3]int64{1, int64(len(bodies[k]["candidates"].([]cand))), 1}
+		if got := perKey[fmt.Sprintf("ledger-key-%d", k)]; got != want {
+			t.Fatalf("key %d reservation (count, amount, committed) = %v, want %v", k, got, want)
+		}
+	}
+	if n := scalar[int](t, e.pool, `SELECT count(*) FROM credit_reservations WHERE workspace_id=$1 AND status='committed'`, ws); n != keys {
 		t.Fatalf("committed reservations = %d, want %d", n, keys)
 	}
-	if n := scalar[int](t, e.pool, `SELECT count(*) FROM credit_ledger_entries WHERE workspace_id=$1 AND entry_type='refund'`, ws); n == 0 {
-		t.Fatal("no refund ledger entries for zero-hit candidates")
+	// One zero-hit per key: refund ledger entries sum to exactly the zero-hit count.
+	const zeroHits = keys
+	var refundN, refundSum int64
+	if err := e.pool.QueryRow(t.Context(), `SELECT count(*), COALESCE(sum(amount),0)::bigint FROM credit_ledger_entries
+		WHERE workspace_id=$1 AND entry_type='refund'`, ws).Scan(&refundN, &refundSum); err != nil {
+		t.Fatal(err)
+	}
+	if refundN != zeroHits || refundSum != zeroHits {
+		t.Fatalf("refund entries = %d summing %d, want %d summing %d", refundN, refundSum, zeroHits, zeroHits)
 	}
 	if got := e.available(ws); got != 495 {
 		t.Fatalf("available = %d, want 495", got)
