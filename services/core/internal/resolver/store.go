@@ -19,6 +19,7 @@ import (
 var (
 	ErrInvalidRequest  = errors.New("invalid resolver request")
 	ErrAlreadyResolved = errors.New("review candidate already resolved")
+	ErrDoNotMerge      = errors.New("records must not merge")
 )
 
 type SourceRecordInput struct {
@@ -56,6 +57,8 @@ func blockKeys(f RecordFacts) []string {
 	state := normalizeText(f.State)
 	add("name:", NormalizeName(f.LegalName), "|", state)
 	add("name:", NormalizeName(f.DBA), "|", state)
+	add("namezip:", NormalizeName(f.LegalName), "|", normalizeText(f.Zip))
+	add("namezip:", NormalizeName(f.DBA), "|", normalizeText(f.Zip))
 	add("addr:", normalizeAddress(f.Address1), "|", normalizeText(f.Zip))
 	add("agent:", NormalizeName(f.RegisteredAgent), "|", state)
 	result := make([]string, 0, len(keys))
@@ -74,11 +77,13 @@ func OrderedPair(a, b string) (string, string) {
 	return a, b
 }
 
-// lockWorkspace serializes resolution writes, including concurrent first ingests.
-func lockWorkspace(ctx context.Context, tx pgx.Tx, workspace string) error {
+// LockWorkspace serializes resolution writes, including concurrent first ingests.
+// It takes the workspace row lock; callers must acquire it before any ledger or source_fetch_cache row locks in the same tx.
+// Repeated calls within the same transaction are safe and retain the lock until transaction end.
+func LockWorkspace(ctx context.Context, tx pgx.Tx, workspaceID string) error {
 	var id string
 	// NO KEY UPDATE permits FK key-share locks already held by enrichment callers.
-	err := tx.QueryRow(ctx, `SELECT id::text FROM workspaces WHERE id=$1 FOR NO KEY UPDATE`, workspace).Scan(&id)
+	err := tx.QueryRow(ctx, `SELECT id::text FROM workspaces WHERE id=$1 FOR NO KEY UPDATE`, workspaceID).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("lock resolver workspace: %w", ErrInvalidRequest)
 	}
@@ -90,9 +95,15 @@ func lockWorkspace(ctx context.Context, tx pgx.Tx, workspace string) error {
 
 // Resolve ingests a source record and updates resolution in the caller's transaction.
 // Existing links survive content changes, preserving rejection and split history.
+// It takes the workspace row lock; callers must acquire it before any ledger or source_fetch_cache row locks in the same tx.
 func Resolve(ctx context.Context, tx pgx.Tx, in SourceRecordInput, now time.Time) (ResolveResult, error) {
 	if in.WorkspaceID == "" || in.SourceSystem == "" || in.ExternalRef == "" {
 		return ResolveResult{}, fmt.Errorf("resolve record: %w", ErrInvalidRequest)
+	}
+	for _, c := range in.Citations {
+		if err := c.Validate(); err != nil {
+			return ResolveResult{}, fmt.Errorf("validate resolver citation: %w", err)
+		}
 	}
 	keys := blockKeys(in.Facts)
 	payload, err := json.Marshal(recordPayload{Facts: in.Facts, Raw: in.Payload, BlockKeys: keys})
@@ -100,7 +111,7 @@ func Resolve(ctx context.Context, tx pgx.Tx, in SourceRecordInput, now time.Time
 		return ResolveResult{}, fmt.Errorf("marshal source payload: %w", err)
 	}
 	hash := sha256.Sum256(payload)
-	if err := lockWorkspace(ctx, tx, in.WorkspaceID); err != nil {
+	if err := LockWorkspace(ctx, tx, in.WorkspaceID); err != nil {
 		return ResolveResult{}, err
 	}
 	var recordID string
@@ -154,14 +165,19 @@ func existingLink(ctx context.Context, tx pgx.Tx, recordID string) (ResolveResul
 	if err != nil {
 		return result, false, fmt.Errorf("load existing resolution: %w", err)
 	}
-	result.Decision = Classify(result.Score)
-	if mode == "auto" {
-		result.Decision = AutoMerge
-	}
 	err = tx.QueryRow(ctx, `SELECT id::text FROM possible_match_candidates
 		WHERE source_record_id=$1 AND status='pending' ORDER BY id LIMIT 1`, recordID).Scan(&result.ReviewCandidateID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return result, false, fmt.Errorf("load existing review candidate: %w", err)
+	}
+	switch mode {
+	case "auto", "manual":
+		result.Decision = AutoMerge
+	case "seed":
+		result.Decision = Distinct
+		if result.ReviewCandidateID != "" {
+			result.Decision = Review
+		}
 	}
 	return result, true, nil
 }
@@ -255,11 +271,6 @@ func bestCandidate(ctx context.Context, tx pgx.Tx, in SourceRecordInput, recordI
 }
 
 func replaceCitations(ctx context.Context, tx pgx.Tx, recordID, canonicalID string, citations []quality.Citation) error {
-	for _, c := range citations {
-		if err := c.Validate(); err != nil {
-			return fmt.Errorf("validate resolver citation: %w", err)
-		}
-	}
 	if _, err := tx.Exec(ctx, `DELETE FROM field_citations WHERE source_record_id=$1`, recordID); err != nil {
 		return fmt.Errorf("delete replaced citations: %w", err)
 	}
@@ -282,6 +293,7 @@ type reviewCandidate struct {
 }
 
 // ResolveReview merges or rejects a pending candidate in the caller's transaction.
+// It takes the workspace row lock; callers must acquire it before any ledger or source_fetch_cache row locks in the same tx.
 func ResolveReview(ctx context.Context, tx pgx.Tx, candidateID, action, actor string, now time.Time) error {
 	var id pgtype.UUID
 	if err := id.Scan(candidateID); err != nil || !id.Valid || (action != "merge" && action != "reject") {
@@ -297,7 +309,7 @@ func ResolveReview(ctx context.Context, tx pgx.Tx, candidateID, action, actor st
 	if err != nil {
 		return fmt.Errorf("find review candidate: %w", err)
 	}
-	if err := lockWorkspace(ctx, tx, c.workspaceID); err != nil {
+	if err := LockWorkspace(ctx, tx, c.workspaceID); err != nil {
 		return err
 	}
 	err = tx.QueryRow(ctx, `SELECT canonical_company_id::text,source_record_id::text,score,match_reasons,status
@@ -325,6 +337,19 @@ func ResolveReview(ctx context.Context, tx pgx.Tx, candidateID, action, actor st
 	}
 	status := "rejected"
 	if action == "merge" {
+		var blocked bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM entity_merge_links l JOIN do_not_merge_pairs p
+			ON (p.record_a_id=$1 AND p.record_b_id=l.source_record_id)
+			OR (p.record_b_id=$1 AND p.record_a_id=l.source_record_id)
+			WHERE l.canonical_company_id=$2 AND l.status='active'
+		)`, c.recordID, c.targetID).Scan(&blocked)
+		if err != nil {
+			return fmt.Errorf("check review do-not-merge pairs: %w", err)
+		}
+		if blocked {
+			return fmt.Errorf("resolve review merge: %w", ErrDoNotMerge)
+		}
 		status = "merged"
 		_, err = tx.Exec(ctx, `UPDATE entity_merge_links SET canonical_company_id=$2,merge_mode='manual',
 			merge_confidence_score=$3,match_reasons=$4,status='active' WHERE source_record_id=$1`, c.recordID, c.targetID, c.score, c.reasons)
@@ -402,12 +427,12 @@ func cleanMergedCompany(ctx context.Context, tx pgx.Tx, oldID, targetID, candida
 	if oldID == targetID {
 		return nil
 	}
-	var active bool
-	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM entity_merge_links WHERE canonical_company_id=$1 AND status='active')`, oldID).Scan(&active)
+	var linked bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM entity_merge_links WHERE canonical_company_id=$1)`, oldID).Scan(&linked)
 	if err != nil {
 		return fmt.Errorf("check merged company links: %w", err)
 	}
-	if active {
+	if linked {
 		// A retained company also lost citations, so its evaluations must be refreshed.
 		if err := evaluate.ReevaluateCompany(ctx, tx, oldID, now); err != nil {
 			return fmt.Errorf("reevaluate retained review company: %w", err)

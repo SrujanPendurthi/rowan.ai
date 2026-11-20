@@ -78,7 +78,7 @@ func TestResolveSameContentNoop(t *testing.T) {
 	}
 	in.FetchedAt = resolverNow.Add(time.Hour)
 	second := ingest(t, pool, in)
-	if first.CanonicalID != second.CanonicalID || first.SourceRecordID != second.SourceRecordID || second.Score != 1 || second.Decision != AutoMerge {
+	if first.CanonicalID != second.CanonicalID || first.SourceRecordID != second.SourceRecordID || second.Score != 1 || second.Decision != Distinct {
 		t.Fatalf("incorrect replay: %+v", second)
 	}
 	if n := countSQL(t, pool, `SELECT count(*) FROM source_records WHERE fetched_at=$1`, resolverNow); n != 1 {
