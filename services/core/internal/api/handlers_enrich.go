@@ -62,6 +62,11 @@ func (s *server) enrichRun(c *call) (response, error) {
 	if in.BuyBoxID != "" && !validUUID(in.BuyBoxID) {
 		return response{}, badRequest("buy_box_id must be a UUID")
 	}
+	if in.BuyBoxID != "" {
+		if err := s.requireBuyBox(c.ctx(), c.key.WorkspaceID, in.BuyBoxID); err != nil {
+			return response{}, err
+		}
+	}
 	cs := toCandidates(in.Candidates)
 	res, err := s.Enrich.Run(c.ctx(), c.key.WorkspaceID, c.key.ID, c.r.Header.Get("Idempotency-Key"), in.BuyBoxID, cs)
 	if errors.Is(err, ledger.ErrInsufficientCredits) {

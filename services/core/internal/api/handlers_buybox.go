@@ -102,14 +102,22 @@ type evaluationJSON struct {
 	EvaluatedAt       time.Time       `json:"evaluated_at"`
 }
 
-// evaluations lists a workspace buy box's evaluations best first; fits empty means all.
-func (s *server) evaluations(ctx context.Context, workspaceID, buyBoxID string, fits []string) ([]evaluationJSON, error) {
+// requireBuyBox returns errNotFound unless the buy box belongs to the workspace.
+func (s *server) requireBuyBox(ctx context.Context, workspaceID, buyBoxID string) error {
 	var exists bool
 	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM buy_boxes WHERE id=$1 AND workspace_id=$2)`, buyBoxID, workspaceID).Scan(&exists); err != nil {
-		return nil, fmt.Errorf("check buy box: %w", err)
+		return fmt.Errorf("check buy box: %w", err)
 	}
 	if !exists {
-		return nil, errNotFound
+		return errNotFound
+	}
+	return nil
+}
+
+// evaluations lists a workspace buy box's evaluations best first; fits empty means all.
+func (s *server) evaluations(ctx context.Context, workspaceID, buyBoxID string, fits []string) ([]evaluationJSON, error) {
+	if err := s.requireBuyBox(ctx, workspaceID, buyBoxID); err != nil {
+		return nil, err
 	}
 	rows, err := s.Pool.Query(ctx, `SELECT c.id::text,c.display_name,c.pending_review,e.fit,e.overall_score::float8,e.criteria_breakdown,e.evaluated_at
 		FROM buy_box_evaluations e JOIN canonical_companies c ON c.id=e.canonical_company_id

@@ -38,7 +38,11 @@ func run(ctx context.Context) error {
 		// Real providers arrive in Plan 4.
 		return errors.New("no provider configured: set ROWAN_PROVIDER=fake")
 	}
-	pool, err := db.Open(ctx, os.Getenv("DATABASE_URL"))
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatal("DATABASE_URL is required")
+	}
+	pool, err := db.Open(ctx, dsn)
 	if err != nil {
 		return err
 	}
@@ -62,6 +66,10 @@ func run(ctx context.Context) error {
 		Addr:              ":" + port,
 		Handler:           api.New(api.Deps{Pool: pool, Enrich: svc, ArtifactDir: artifactDir, Now: time.Now}),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		// Above the API's 10m idempotent-handler deadline so slow handlers can still write their response.
+		WriteTimeout: 11 * time.Minute,
+		IdleTimeout:  120 * time.Second,
 	}
 	go sweep(ctx, pool)
 	errc := make(chan error, 1)
@@ -80,23 +88,27 @@ func run(ctx context.Context) error {
 	return nil
 }
 
-// sweep expires due credit lots and refunds stale reservations every minute until ctx ends.
+// sweep expires due credit lots and refunds stale reservations at startup, then every minute until ctx ends.
 // Errors are logged; the loop keeps running.
 func sweep(ctx context.Context, pool *pgxpool.Pool) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
+		sweepOnce(ctx, pool)
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
-		now := time.Now()
-		if _, err := ledger.ExpireDue(ctx, pool, now); err != nil {
-			log.Printf("expire credits: %v", err)
-		}
-		if _, err := ledger.ReleaseStale(ctx, pool, 15*time.Minute, now); err != nil {
-			log.Printf("release stale reservations: %v", err)
-		}
+	}
+}
+
+func sweepOnce(ctx context.Context, pool *pgxpool.Pool) {
+	now := time.Now()
+	if _, err := ledger.ExpireDue(ctx, pool, now); err != nil {
+		log.Printf("expire credits: %v", err)
+	}
+	if _, err := ledger.ReleaseStale(ctx, pool, 15*time.Minute, now); err != nil {
+		log.Printf("release stale reservations: %v", err)
 	}
 }

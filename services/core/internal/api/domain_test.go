@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -423,8 +425,7 @@ func TestIdempotencyInProgressAndStaleTakeover(t *testing.T) {
 
 func TestServerErrorsAreNotStoredOrLeaked(t *testing.T) {
 	e := newEnv(t)
-	_, keyID, token := e.tenant(ledger.Solo)
-	_ = keyID
+	_, _, token := e.tenant(ledger.Solo)
 	nilEnrich := New(Deps{Pool: e.pool, Enrich: nil, ArtifactDir: e.dir, Now: e.clock})
 	e.h = nilEnrich // Run dereferences the nil service: panic => 500.
 	rec := e.run(token, "k1", candidates(1), "")
@@ -478,27 +479,86 @@ func TestIdempotencyConcurrentSameKeyChargesOnce(t *testing.T) {
 	cs := candidates(2)
 	e.provide(cs)
 	e.provider.OnLookup = func(context.Context, enrich.Candidate) { time.Sleep(40 * time.Millisecond) }
-	codes := make(chan int, 6)
-	for range cap(codes) {
+	type result struct {
+		code int
+		body string
+	}
+	results := make(chan result, 6)
+	for range cap(results) {
 		go func() {
 			rec := e.run(token, "same", cs, "")
-			codes <- rec.Code
+			results <- result{rec.Code, rec.Body.String()}
 		}()
 	}
 	ok := 0
-	for range cap(codes) {
-		switch code := <-codes; code {
-		case 200:
+	var bad []string
+	for range cap(results) {
+		switch r := <-results; {
+		case r.code == 200:
 			ok++
-		case 409: // request_in_progress while the owner works
+		case r.code == 409 && strings.Contains(r.body, `"request_in_progress"`): // owner still working
 		default:
-			t.Fatalf("unexpected status %d", code)
+			bad = append(bad, fmt.Sprintf("%d %s", r.code, r.body))
 		}
+	}
+	if len(bad) > 0 {
+		t.Fatalf("unexpected responses: %v", bad)
 	}
 	if ok == 0 {
 		t.Fatal("no request succeeded")
 	}
 	if e.provider.Calls.Load() != 2 || e.available(ws) != 498 {
 		t.Fatalf("calls=%d available=%d, want 2 lookups and one charge", e.provider.Calls.Load(), e.available(ws))
+	}
+}
+
+func TestIdempotencyFencedAfterTakeover(t *testing.T) {
+	e := newEnv(t)
+	ws, keyID, _ := e.tenant(ledger.Solo)
+	srv := &server{Deps: Deps{Pool: e.pool, ArtifactDir: e.dir, Now: e.clock}}
+	newCall := func(now time.Time) *call {
+		return &call{r: httptest.NewRequest("POST", "/v1/x", nil), key: apiKey{ID: keyID, WorkspaceID: ws}, now: now}
+	}
+	hash := []byte("h")
+	a, b := newCall(testNow), newCall(testNow.Add(16*time.Minute))
+	_, claimedA, owned, err := srv.claim(a, "k1", hash)
+	if err != nil || !owned {
+		t.Fatalf("A claim owned=%v err=%v", owned, err)
+	}
+	_, claimedB, owned, err := srv.claim(b, "k1", hash)
+	if err != nil || !owned {
+		t.Fatalf("B takeover owned=%v err=%v", owned, err)
+	}
+	if claimedA.Equal(claimedB) {
+		t.Fatal("takeover kept the old fencing token")
+	}
+	srv.store(b, "k1", claimedB, jsonResponse(200, map[string]string{"by": "b"}))
+	// A's late store and release must not touch B's row.
+	srv.store(a, "k1", claimedA, jsonResponse(201, map[string]string{"by": "a"}))
+	srv.release(a, "k1", claimedA)
+	var status int
+	var body string
+	if err := e.pool.QueryRow(t.Context(), `SELECT status_code, convert_from(response_body,'UTF8') FROM idempotency_records
+		WHERE workspace_id=$1 AND key='k1'`, ws).Scan(&status, &body); err != nil {
+		t.Fatalf("B's row gone: %v", err)
+	}
+	if status != 200 || !strings.Contains(body, `"b"`) {
+		t.Fatalf("B's row overwritten: %d %s", status, body)
+	}
+}
+
+func TestEnrichRunForeignBuyBoxIsNotFound(t *testing.T) {
+	e := newEnv(t)
+	wsA, _, tokenA := e.tenant(ledger.Solo)
+	_, _, tokenB := e.tenant(ledger.Solo)
+	bb := e.buyBox(tokenB, "kb")
+	cs := candidates(1)
+	e.provide(cs)
+	wantError(t, e.run(tokenA, "k1", cs, bb), 404, "not_found")
+	if n := scalar[int](t, e.pool, `SELECT count(*) FROM credit_reservations WHERE workspace_id=$1`, wsA); n != 0 {
+		t.Fatalf("reservations = %d", n)
+	}
+	if e.provider.Calls.Load() != 0 {
+		t.Fatal("provider called for a foreign buy box")
 	}
 }

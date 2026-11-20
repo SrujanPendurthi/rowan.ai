@@ -3,8 +3,6 @@ package api
 import (
 	"fmt"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 func (s *server) credits(c *call) (response, error) {
@@ -35,7 +33,7 @@ func (s *server) credits(c *call) (response, error) {
 	err = s.Pool.QueryRow(c.ctx(), `SELECT COALESCE(sum(CASE status WHEN 'reserved' THEN amount
 		WHEN 'committed' THEN committed_amount ELSE 0 END),0)::bigint FROM credit_reservations
 		WHERE api_key_id=$1 AND created_at>=$2 AND created_at<$3`, c.key.ID, monthStart, monthStart.AddDate(0, 1, 0)).Scan(&spent)
-	if err != nil && err != pgx.ErrNoRows {
+	if err != nil {
 		return response{}, fmt.Errorf("sum key spend: %w", err)
 	}
 	return jsonResponse(200, map[string]any{
