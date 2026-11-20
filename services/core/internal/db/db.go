@@ -28,18 +28,23 @@ func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
 
 // Migrate applies unapplied SQL files in lexical order, each in its own transaction.
 func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
-	if _, err := pool.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-		version text PRIMARY KEY,
-		applied_at timestamptz
-	)`); err != nil {
-		return fmt.Errorf("create migration ledger: %w", err)
-	}
 	files, err := fs.Glob(migrations.FS, "*.sql")
 	if err != nil {
 		return fmt.Errorf("list migrations: %w", err)
 	}
 	for _, file := range files {
 		if err := InTx(ctx, pool, func(tx pgx.Tx) error {
+			// Serialize ledger creation and migration checks across all callers.
+			if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(726692413001)"); err != nil {
+				return fmt.Errorf("lock migrations: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+				version text PRIMARY KEY,
+				applied_at timestamptz NOT NULL DEFAULT now()
+			)`); err != nil {
+				return fmt.Errorf("create migration ledger: %w", err)
+			}
+
 			var applied bool
 			if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)", file).Scan(&applied); err != nil {
 				return fmt.Errorf("check migration: %w", err)
