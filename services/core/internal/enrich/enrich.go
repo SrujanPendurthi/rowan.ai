@@ -2,6 +2,7 @@
 package enrich
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -106,14 +107,6 @@ func (s *Service) tier(ctx context.Context, workspaceID string) (ledger.Tier, er
 	return tier, nil
 }
 
-func refs(cs []Candidate) []string {
-	out := make([]string, len(cs))
-	for i, c := range cs {
-		out[i] = c.Ref
-	}
-	return out
-}
-
 // Quote is read-only: it never writes credit tables, cache, or runs.
 func (s *Service) Quote(ctx context.Context, workspaceID string, cs []Candidate) (Quote, error) {
 	cs, err := dedupe(cs)
@@ -125,7 +118,7 @@ func (s *Service) Quote(ctx context.Context, workspaceID string, cs []Candidate)
 		return Quote{}, err
 	}
 	now := s.now()
-	cached, err := s.freshCache(ctx, refs(cs), now)
+	cached, err := s.freshCache(ctx, cacheKeys(workspaceID, cs), now)
 	if err != nil {
 		return Quote{}, err
 	}
@@ -141,14 +134,19 @@ func (s *Service) Quote(ctx context.Context, workspaceID string, cs []Candidate)
 	return q, nil
 }
 
+// abandonedAfter is how long a 'running' row may sit before a retry treats its run as dead.
+// ponytail: equals the ledger.ReleaseStale window; the 10m runTimeout guarantees a live run is never this old.
+const abandonedAfter = 15 * time.Minute
+
 // claimRun inserts the run row. A non-nil stored result is an idempotent replay.
-func (s *Service) claimRun(ctx context.Context, workspaceID, idemKey, buyBoxID string, count int) (string, *RunResult, error) {
+func (s *Service) claimRun(ctx context.Context, workspaceID, idemKey, buyBoxID string, cs []Candidate) (string, *RunResult, error) {
+	hash := requestHash(buyBoxID, cs)
 	for range 3 {
 		var id string
-		err := s.Pool.QueryRow(ctx, `INSERT INTO enrichment_runs(workspace_id,idempotency_key,buy_box_id,candidate_count,status)
-			VALUES ($1,$2,NULLIF($3,'')::uuid,$4,'running')
+		err := s.Pool.QueryRow(ctx, `INSERT INTO enrichment_runs(workspace_id,idempotency_key,buy_box_id,candidate_count,status,request_hash)
+			VALUES ($1,$2,NULLIF($3,'')::uuid,$4,'running',$5)
 			ON CONFLICT (workspace_id, idempotency_key) DO NOTHING RETURNING id::text`,
-			workspaceID, idemKey, buyBoxID, count).Scan(&id)
+			workspaceID, idemKey, buyBoxID, len(cs), hash).Scan(&id)
 		if err == nil {
 			return id, nil, nil
 		}
@@ -156,20 +154,31 @@ func (s *Service) claimRun(ctx context.Context, workspaceID, idemKey, buyBoxID s
 			return "", nil, classify("claim run", err)
 		}
 		var existing int
-		var raw []byte
-		err = s.Pool.QueryRow(ctx, `SELECT candidate_count, result FROM enrichment_runs
-			WHERE workspace_id=$1 AND idempotency_key=$2`, workspaceID, idemKey).Scan(&existing, &raw)
+		var raw, storedHash []byte
+		var runID, reservationID string
+		var abandoned bool
+		err = s.Pool.QueryRow(ctx, `SELECT id::text, candidate_count, request_hash, result, COALESCE(reservation_id::text,''),
+			created_at < now() - make_interval(secs => $3)
+			FROM enrichment_runs WHERE workspace_id=$1 AND idempotency_key=$2`,
+			workspaceID, idemKey, abandonedAfter.Seconds()).Scan(&runID, &existing, &storedHash, &raw, &reservationID, &abandoned)
 		if errors.Is(err, pgx.ErrNoRows) {
 			continue // the winner failed to reserve and deleted its row; claim again
 		}
 		if err != nil {
 			return "", nil, fmt.Errorf("enrich: load run: %w", err)
 		}
-		if existing != count {
-			return "", nil, fmt.Errorf("enrich: run key reused with different candidates: %w", ledger.ErrIdempotencyConflict)
+		if existing != len(cs) || (storedHash != nil && !bytes.Equal(storedHash, hash)) {
+			return "", nil, fmt.Errorf("enrich: run key reused with different request: %w", ledger.ErrIdempotencyConflict)
 		}
 		if raw == nil {
-			return "", nil, ErrRunInProgress
+			if !abandoned {
+				return "", nil, ErrRunInProgress
+			}
+			res, err := s.recoverAbandoned(ctx, runID, reservationID)
+			if err != nil {
+				return "", nil, err
+			}
+			return "", &res, nil
 		}
 		var stored RunResult
 		if err := json.Unmarshal(raw, &stored); err != nil {
@@ -180,8 +189,39 @@ func (s *Service) claimRun(ctx context.Context, workspaceID, idemKey, buyBoxID s
 	return "", nil, ErrRunInProgress
 }
 
-func (s *Service) dropRun(ctx context.Context, runID string) {
-	_, _ = s.Pool.Exec(context.WithoutCancel(ctx), `DELETE FROM enrichment_runs WHERE id=$1 AND reservation_id IS NULL`, runID)
+// recoverAbandoned refunds a dead run's reservation and finalizes its row as failed.
+func (s *Service) recoverAbandoned(ctx context.Context, runID, reservationID string) (RunResult, error) {
+	ctx = context.WithoutCancel(ctx)
+	res := RunResult{RunID: runID, ReservationID: reservationID, Companies: []string{}}
+	if reservationID != "" {
+		_, err := ledger.Settle(ctx, s.Pool, reservationID, 0, s.now())
+		if err != nil && !errors.Is(err, ledger.ErrIdempotencyConflict) {
+			return RunResult{}, fmt.Errorf("enrich: refund abandoned run: %w", err)
+		}
+		// Conflict means the reservation was already committed: report what was charged.
+		var amount, committed int64
+		if err := s.Pool.QueryRow(ctx, `SELECT amount, committed_amount FROM credit_reservations WHERE id=$1`, reservationID).Scan(&amount, &committed); err != nil {
+			return RunResult{}, fmt.Errorf("enrich: load abandoned reservation: %w", err)
+		}
+		res.CreditsCommitted, res.CreditsRefunded = committed, amount-committed
+	}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		return RunResult{}, fmt.Errorf("enrich: marshal result: %w", err)
+	}
+	if _, err := s.Pool.Exec(ctx, `UPDATE enrichment_runs SET status='failed', result=$2, finished_at=$3 WHERE id=$1 AND result IS NULL`,
+		runID, raw, s.now()); err != nil {
+		return RunResult{}, fmt.Errorf("enrich: finalize abandoned run: %w", err)
+	}
+	return res, nil
+}
+
+// dropRun deletes a run row that never reserved credits.
+func (s *Service) dropRun(ctx context.Context, runID string) error {
+	if _, err := s.Pool.Exec(context.WithoutCancel(ctx), `DELETE FROM enrichment_runs WHERE id=$1 AND reservation_id IS NULL`, runID); err != nil {
+		return fmt.Errorf("enrich: drop run: %w", err)
+	}
+	return nil
 }
 
 // Run reserves one credit per uncached candidate, enriches, commits hits, and refunds the rest.
@@ -209,7 +249,7 @@ func (s *Service) Run(ctx context.Context, workspaceID, apiKeyID, idemKey, buyBo
 	}
 	ctx, cancel := context.WithTimeout(ctx, runTimeout)
 	defer cancel()
-	runID, stored, err := s.claimRun(ctx, workspaceID, idemKey, buyBoxID, len(cs))
+	runID, stored, err := s.claimRun(ctx, workspaceID, idemKey, buyBoxID, cs)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -221,15 +261,14 @@ func (s *Service) Run(ctx context.Context, workspaceID, apiKeyID, idemKey, buyBo
 
 func (s *Service) execute(ctx context.Context, workspaceID, apiKeyID, idemKey, runID string, cs []Candidate) (RunResult, error) {
 	now := s.now()
-	cached, err := s.freshCache(ctx, refs(cs), now)
+	cached, err := s.freshCache(ctx, cacheKeys(workspaceID, cs), now)
 	if err != nil {
-		s.dropRun(ctx, runID)
-		return RunResult{}, err
+		return RunResult{}, errors.Join(err, s.dropRun(ctx, runID))
 	}
 	var billable, hitCached []Candidate
 	res := RunResult{RunID: runID, Companies: []string{}}
 	for _, c := range cs {
-		row, ok := cached[c.Ref]
+		row, ok := cached[cacheKey(workspaceID, c)]
 		switch {
 		case !ok:
 			billable = append(billable, c)
@@ -246,10 +285,14 @@ func (s *Service) execute(ctx context.Context, workspaceID, apiKeyID, idemKey, r
 			err = fmt.Errorf("enrich: reservation for key already settled: %w", ledger.ErrIdempotencyConflict)
 		}
 		if err != nil {
-			s.dropRun(ctx, runID)
-			return RunResult{}, err
+			return RunResult{}, errors.Join(err, s.dropRun(ctx, runID))
 		}
 		res.ReservationID = r.ID
+		// Persist the link at once so a crash leaves a recoverable row.
+		if _, err := s.Pool.Exec(ctx, `UPDATE enrichment_runs SET reservation_id=$2 WHERE id=$1`, runID, r.ID); err != nil {
+			_, refundErr := ledger.Settle(context.WithoutCancel(ctx), s.Pool, r.ID, 0, now)
+			return RunResult{}, errors.Join(fmt.Errorf("enrich: link reservation: %w", err), refundErr, s.dropRun(ctx, runID))
+		}
 	}
 	companies := map[string]struct{}{}
 	add := func(ids []string) {
@@ -263,7 +306,7 @@ func (s *Service) execute(ctx context.Context, workspaceID, apiKeyID, idemKey, r
 		if runErr = ctx.Err(); runErr != nil {
 			break
 		}
-		ids, err := s.resolveCached(ctx, workspaceID, cached[c.Ref].payload, now)
+		ids, err := s.resolveCached(ctx, workspaceID, cached[cacheKey(workspaceID, c)].payload, now)
 		if err != nil {
 			res.Failed++
 			continue
@@ -295,7 +338,7 @@ func (s *Service) execute(ctx context.Context, workspaceID, apiKeyID, idemKey, r
 			continue
 		}
 		// A delivered answer is persisted even if ctx was canceled during the lookup.
-		ids, err := s.storeLookup(context.WithoutCancel(ctx), workspaceID, c.Ref, recs, s.now())
+		ids, err := s.storeLookup(context.WithoutCancel(ctx), workspaceID, cacheKey(workspaceID, c), recs, s.now())
 		switch {
 		case err != nil:
 			res.Failed++

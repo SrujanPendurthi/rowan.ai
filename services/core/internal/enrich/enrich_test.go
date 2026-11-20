@@ -98,10 +98,10 @@ func snapshot(t *testing.T, pool *pgxpool.Pool) string {
 		(SELECT COALESCE(jsonb_agg(to_jsonb(r) ORDER BY id),'[]') FROM credit_reservations r)::text)`)
 }
 
-func seedCache(t *testing.T, pool *pgxpool.Pool, ref string, fetched time.Time) {
+func seedCache(t *testing.T, pool *pgxpool.Pool, ws string, c Candidate, fetched time.Time) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `INSERT INTO source_fetch_cache(provider,cache_key,content_hash,payload,zero_hit,fetched_at)
-		VALUES ('fake',$1,'\x00',NULL,true,$2)`, ref, fetched); err != nil {
+		VALUES ('fake',$1,'\x00',NULL,true,$2)`, cacheKey(ws, c), fetched); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -254,7 +254,7 @@ func TestRunCachedCandidateFree(t *testing.T) {
 	assertInvariants(t, pool, ws)
 }
 
-func TestRunCachedPayloadResolvesIntoOtherWorkspace(t *testing.T) {
+func TestCacheIsolatedPerWorkspace(t *testing.T) {
 	pool := testdb.New(t)
 	a, b := seedWorkspace(t, pool, ledger.Solo), seedWorkspace(t, pool, ledger.Solo)
 	fund(t, pool, a, 5)
@@ -263,18 +263,118 @@ func TestRunCachedPayloadResolvesIntoOtherWorkspace(t *testing.T) {
 	p := hitProvider(cs, nil, nil)
 	s := newService(pool, p)
 	mustRun(t, s, a, "k", "", cs)
+	q, err := s.Quote(context.Background(), b, cs)
+	if err != nil || q.AlreadyEnriched != 0 || q.Billable != 1 {
+		t.Fatalf("Quote B = %+v, %v", q, err)
+	}
+	calls := p.Calls.Load()
 	res := mustRun(t, s, b, "k", "", cs)
-	if res.Cached != 1 || len(res.Companies) != 1 {
-		t.Fatalf("RunResult = %+v", res)
+	if p.Calls.Load() != calls+1 || res.Cached != 0 || res.Hits != 1 || res.CreditsCommitted != 1 {
+		t.Fatalf("RunResult B = %+v calls %d->%d", res, calls, p.Calls.Load())
 	}
-	if n := scalar[int](t, pool, `SELECT count(*) FROM source_records WHERE workspace_id=$1`, b); n != 1 {
-		t.Fatalf("workspace B source records = %d", n)
-	}
-	if n := scalar[int](t, pool, `SELECT count(*) FROM canonical_companies WHERE workspace_id=$1 AND id=$2`, b, res.Companies[0]); n != 1 {
-		t.Fatal("company not in workspace B")
+	// Workspace A's cached row is still free for A.
+	if again := mustRun(t, s, a, "k2", "", cs); again.Cached != 1 || again.ReservationID != "" {
+		t.Fatalf("RunResult A again = %+v", again)
 	}
 	assertInvariants(t, pool, a)
 	assertInvariants(t, pool, b)
+}
+
+func TestCacheKeyedByIdentity(t *testing.T) {
+	pool := testdb.New(t)
+	ws := seedWorkspace(t, pool, ledger.Solo)
+	fund(t, pool, ws, 5)
+	cs := cands(1)
+	p := hitProvider(cs, nil, nil)
+	s := newService(pool, p)
+	mustRun(t, s, ws, "k1", "", cs)
+	same := []Candidate{{Ref: "c1", LegalName: "  ZEPHYR plumbing, L.L.C. ", State: " tx "}}
+	if q, err := s.Quote(context.Background(), ws, same); err != nil || q.AlreadyEnriched != 1 {
+		t.Fatalf("normalized identity Quote = %+v, %v", q, err)
+	}
+	other := []Candidate{{Ref: "c1", LegalName: "Totally Different Holdings", State: "TX"}}
+	q, err := s.Quote(context.Background(), ws, other)
+	if err != nil || q.AlreadyEnriched != 0 || q.Billable != 1 {
+		t.Fatalf("different identity Quote = %+v, %v", q, err)
+	}
+	p.Results["c1"] = []resolver.SourceRecordInput{record(other[0])}
+	calls := p.Calls.Load()
+	res := mustRun(t, s, ws, "k2", "", other)
+	if p.Calls.Load() != calls+1 || res.Cached != 0 || res.CreditsCommitted != 1 {
+		t.Fatalf("RunResult = %+v", res)
+	}
+	assertInvariants(t, pool, ws)
+}
+
+func TestAbandonedRunFinalizedOnRetry(t *testing.T) {
+	pool := testdb.New(t)
+	ws := seedWorkspace(t, pool, ledger.Solo)
+	fund(t, pool, ws, 10)
+	cs := cands(3)
+	p := hitProvider(cs, nil, nil)
+	s := newService(pool, p)
+	r, err := ledger.Reserve(context.Background(), pool, ledger.ReserveRequest{WorkspaceID: ws, IdempotencyKey: "k", Amount: 3}, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := requestHash("", cs)
+	runID := scalar[string](t, pool, `INSERT INTO enrichment_runs(workspace_id,idempotency_key,candidate_count,status,reservation_id,request_hash,created_at)
+		VALUES ($1,'k',3,'running',$2,$3,now()-interval '20 minutes') RETURNING id::text`, ws, r.ID, hash)
+	// A fresh stuck row (not yet abandoned) still reports in-progress.
+	if _, err := pool.Exec(context.Background(), `UPDATE enrichment_runs SET created_at=now() WHERE id=$1`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Run(context.Background(), ws, "", "k", "", cs); !errors.Is(err, ErrRunInProgress) {
+		t.Fatalf("fresh running row: err = %v, want ErrRunInProgress", err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE enrichment_runs SET created_at=now()-interval '20 minutes' WHERE id=$1`, runID); err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.Run(context.Background(), ws, "", "k", "", cs)
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if res.RunID != runID || res.ReservationID != r.ID || res.CreditsCommitted != 0 || res.CreditsRefunded != 3 || p.Calls.Load() != 0 {
+		t.Fatalf("RunResult = %+v calls=%d", res, p.Calls.Load())
+	}
+	if st := scalar[string](t, pool, `SELECT status FROM enrichment_runs WHERE id=$1`, runID); st != "failed" {
+		t.Fatalf("run status = %s, want failed", st)
+	}
+	if st := scalar[string](t, pool, `SELECT status FROM credit_reservations WHERE id=$1`, r.ID); st != "refunded" {
+		t.Fatalf("reservation status = %s", st)
+	}
+	again, err := s.Run(context.Background(), ws, "", "k", "", cs)
+	if err != nil || !reflect.DeepEqual(again, res) {
+		t.Fatalf("replay = %+v, %v", again, err)
+	}
+	assertInvariants(t, pool, ws)
+}
+
+func TestRunKeyReuseSameCountDifferentPayloadConflicts(t *testing.T) {
+	pool := testdb.New(t)
+	ws := seedWorkspace(t, pool, ledger.Solo)
+	fund(t, pool, ws, 10)
+	cs := cands(2)
+	p := hitProvider(cands(4), nil, nil)
+	s := newService(pool, p)
+	mustRun(t, s, ws, "same", "", cs)
+	calls := p.Calls.Load()
+	ctx := context.Background()
+	if _, err := s.Run(ctx, ws, "", "same", "", cands(4)[2:]); !errors.Is(err, ledger.ErrIdempotencyConflict) {
+		t.Fatalf("different refs: err = %v, want ErrIdempotencyConflict", err)
+	}
+	box := scalar[string](t, pool, `INSERT INTO buy_boxes(workspace_id,name,criteria) VALUES ($1,'b','{"states_in":["TX"]}') RETURNING id::text`, ws)
+	if _, err := s.Run(ctx, ws, "", "same", box, cs); !errors.Is(err, ledger.ErrIdempotencyConflict) {
+		t.Fatalf("different buy box: err = %v, want ErrIdempotencyConflict", err)
+	}
+	// Reordered identical payload still replays.
+	if res, err := s.Run(ctx, ws, "", "same", "", []Candidate{cs[1], cs[0]}); err != nil || res.Hits != 2 {
+		t.Fatalf("reordered replay = %+v, %v", res, err)
+	}
+	if p.Calls.Load() != calls {
+		t.Fatal("conflict or replay called provider")
+	}
+	assertInvariants(t, pool, ws)
 }
 
 func TestRunCanceledSettlesPartial(t *testing.T) {
@@ -303,7 +403,7 @@ func TestRunCanceledSettlesPartial(t *testing.T) {
 	if st := scalar[string](t, pool, `SELECT status FROM enrichment_runs WHERE id=$1`, res.RunID); st != "completed" {
 		t.Fatalf("run status = %s", st)
 	}
-	if n := scalar[int](t, pool, `SELECT count(*) FROM source_fetch_cache WHERE cache_key='c1' AND NOT zero_hit`); n != 1 {
+	if n := scalar[int](t, pool, `SELECT count(*) FROM source_fetch_cache WHERE cache_key=$1 AND NOT zero_hit`, cacheKey(ws, cs[0])); n != 1 {
 		t.Fatal("delivered hit not persisted")
 	}
 	assertInvariants(t, pool, ws)
@@ -381,7 +481,7 @@ func TestQuoteIsFree(t *testing.T) {
 	ws := seedWorkspace(t, pool, ledger.Solo)
 	fund(t, pool, ws, 10)
 	cs := cands(3)
-	seedCache(t, pool, "c2", testNow.Add(-time.Hour))
+	seedCache(t, pool, ws, cs[1], testNow.Add(-time.Hour))
 	before := snapshot(t, pool)
 	q, err := newService(pool, &FakeProvider{}).Quote(context.Background(), ws, cs)
 	if err != nil {
@@ -400,11 +500,12 @@ func TestQuoteIsFree(t *testing.T) {
 func TestQuoteStaleCacheIsBillable(t *testing.T) {
 	pool := testdb.New(t)
 	ws := seedWorkspace(t, pool, ledger.Solo)
-	seedCache(t, pool, "c1", testNow.Add(-30*24*time.Hour)) // exactly TTL old: not fresh
+	seedCache(t, pool, ws, cands(1)[0], testNow.Add(-30*24*time.Hour)) // exactly TTL old: not fresh
 	q, err := newService(pool, &FakeProvider{}).Quote(context.Background(), ws, cands(1))
 	if err != nil || q.AlreadyEnriched != 0 || q.Billable != 1 {
 		t.Fatalf("Quote = %+v, %v", q, err)
 	}
+	assertInvariants(t, pool, ws)
 }
 
 func TestQuoteShortfallOverage(t *testing.T) {
@@ -441,7 +542,7 @@ func TestRunCommitsHitsRefundsZeroHits(t *testing.T) {
 	if st := scalar[string](t, pool, `SELECT status FROM enrichment_runs WHERE id=$1`, res.RunID); st != "completed" {
 		t.Fatalf("run status = %s", st)
 	}
-	if n := scalar[int](t, pool, `SELECT count(*) FROM source_fetch_cache WHERE zero_hit AND cache_key='c3' AND payload IS NULL`); n != 1 {
+	if n := scalar[int](t, pool, `SELECT count(*) FROM source_fetch_cache WHERE zero_hit AND cache_key=$1 AND payload IS NULL`, cacheKey(ws, cs[2])); n != 1 {
 		t.Fatalf("zero-hit cache rows = %d", n)
 	}
 	if n := scalar[int](t, pool, `SELECT count(*) FROM source_fetch_cache WHERE NOT zero_hit AND payload IS NOT NULL`); n != 2 {
@@ -463,7 +564,7 @@ func TestRunRefundsFailures(t *testing.T) {
 	if st := scalar[string](t, pool, `SELECT status FROM enrichment_runs WHERE id=$1`, res.RunID); st != "completed" {
 		t.Fatalf("run status = %s", st)
 	}
-	if n := scalar[int](t, pool, `SELECT count(*) FROM source_fetch_cache WHERE cache_key='c2'`); n != 0 {
+	if n := scalar[int](t, pool, `SELECT count(*) FROM source_fetch_cache WHERE cache_key=$1`, cacheKey(ws, cs[1])); n != 0 {
 		t.Fatal("failed lookup wrote cache")
 	}
 	assertInvariants(t, pool, ws)

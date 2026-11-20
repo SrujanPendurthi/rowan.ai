@@ -3,8 +3,11 @@ package enrich
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,11 +21,47 @@ type cacheRow struct {
 	payload []byte
 }
 
-// freshCache returns cache rows for refs fetched strictly within CacheTTL of now.
-func (s *Service) freshCache(ctx context.Context, refs []string, now time.Time) (map[string]cacheRow, error) {
+// identity is the provider-independent description of a candidate: normalized name, state, and IDs.
+func identity(c Candidate) string {
+	ids := make([]string, 0, len(c.IDs))
+	for k, v := range c.IDs {
+		ids = append(ids, strings.ToLower(strings.TrimSpace(k))+"="+strings.ToLower(strings.TrimSpace(v)))
+	}
+	sort.Strings(ids)
+	return resolver.NormalizeName(c.LegalName) + "|" + strings.ToUpper(strings.TrimSpace(c.State)) + "|" + strings.Join(ids, ",")
+}
+
+// cacheKey scopes cached provider answers to one workspace and one candidate identity.
+// The client-supplied Ref is deliberately not part of it: refs are not trusted to name a company.
+func cacheKey(workspaceID string, c Candidate) string {
+	sum := sha256.Sum256([]byte(identity(c)))
+	return workspaceID + ":" + hex.EncodeToString(sum[:])
+}
+
+// requestHash fingerprints a run request: buy box plus every candidate's ref and identity, order-independent.
+func requestHash(buyBoxID string, cs []Candidate) []byte {
+	lines := make([]string, 0, len(cs))
+	for _, c := range cs {
+		lines = append(lines, c.Ref+"|"+identity(c))
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(buyBoxID + "\n" + strings.Join(lines, "\n")))
+	return sum[:]
+}
+
+func cacheKeys(workspaceID string, cs []Candidate) []string {
+	out := make([]string, len(cs))
+	for i, c := range cs {
+		out[i] = cacheKey(workspaceID, c)
+	}
+	return out
+}
+
+// freshCache returns cache rows by cache_key, fetched strictly within CacheTTL of now.
+func (s *Service) freshCache(ctx context.Context, keys []string, now time.Time) (map[string]cacheRow, error) {
 	rows, err := s.Pool.Query(ctx, `SELECT cache_key, zero_hit, payload FROM source_fetch_cache
 		WHERE provider=$1 AND cache_key = ANY($2) AND fetched_at > $3`,
-		s.Provider.Name(), refs, now.Add(-s.CacheTTL))
+		s.Provider.Name(), keys, now.Add(-s.CacheTTL))
 	if err != nil {
 		return nil, fmt.Errorf("enrich: read cache: %w", err)
 	}
@@ -56,7 +95,7 @@ func upsertCache(ctx context.Context, tx pgx.Tx, provider, key string, payload [
 }
 
 // resolveAll resolves records into workspaceID; the caller already holds resolver.LockWorkspace.
-// The cache is workspace-agnostic, so the target workspace always overrides the record's own.
+// Cached payloads carry no workspace, so the target workspace always overrides the record's own.
 func resolveAll(ctx context.Context, tx pgx.Tx, workspaceID string, recs []resolver.SourceRecordInput, now time.Time) ([]string, error) {
 	ids := make([]string, 0, len(recs))
 	for _, in := range recs {
@@ -74,7 +113,7 @@ func resolveAll(ctx context.Context, tx pgx.Tx, workspaceID string, recs []resol
 }
 
 // storeLookup persists a provider answer: hits resolve and cache atomically; zero-hits cache only.
-func (s *Service) storeLookup(ctx context.Context, workspaceID, ref string, recs []resolver.SourceRecordInput, now time.Time) ([]string, error) {
+func (s *Service) storeLookup(ctx context.Context, workspaceID, key string, recs []resolver.SourceRecordInput, now time.Time) ([]string, error) {
 	var payload []byte
 	if len(recs) > 0 {
 		stored := make([]resolver.SourceRecordInput, len(recs))
@@ -100,10 +139,10 @@ func (s *Service) storeLookup(ctx context.Context, workspaceID, ref string, recs
 		if ids, err = resolveAll(ctx, tx, workspaceID, recs, now); err != nil {
 			return err
 		}
-		return upsertCache(ctx, tx, s.Provider.Name(), ref, payload, len(recs) == 0, now)
+		return upsertCache(ctx, tx, s.Provider.Name(), key, payload, len(recs) == 0, now)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("enrich: store lookup %s: %w", ref, err)
+		return nil, fmt.Errorf("enrich: store lookup %s: %w", key, err)
 	}
 	return ids, nil
 }
