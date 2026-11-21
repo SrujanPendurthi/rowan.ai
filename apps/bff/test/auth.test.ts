@@ -61,6 +61,11 @@ test('signup, normalized login, transactional duplicates, logout, and absolute e
   });
   assert.equal(short.status, 400);
   assert.match(await short.text(), /invalid_request/);
+  const blankWorkspace = await client.request('POST', '/api/auth/signup', {
+    body: { email: 'blank@example.com', password, workspace_name: '   ' },
+  });
+  assert.equal(blankWorkspace.status, 400);
+  assert.equal(z.object({ error: z.object({ code: z.literal('invalid_request') }) }).safeParse(await blankWorkspace.json()).success, true);
   const login = await client.request('POST', '/api/auth/login', { body: { email: 'FOUNDER@example.com', password } });
   assert.equal(login.status, 200);
   assert.deepEqual(accountSchema.parse(await login.json()), account);

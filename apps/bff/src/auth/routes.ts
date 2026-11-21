@@ -12,7 +12,7 @@ const credentials = z.object({
   email: z.string().trim().toLowerCase().pipe(z.email().max(254)),
   password: z.string().min(12).max(256),
 });
-const signupBody = credentials.extend({ workspace_name: z.string().min(1).max(100) });
+const signupBody = credentials.extend({ workspace_name: z.string().trim().min(1).max(100) });
 type Workspace = { id: string; name: string; tier: string };
 type User = { id: string; email: string };
 
