@@ -63,13 +63,13 @@ export function authRoutes(deps: Deps) {
           sendError(res, 429, 'rate_limited', 'too many login attempts', { 'Retry-After': String(wait) });
           return;
         }
+        limiter.fail(body.email, now());
         const user = (await deps.pool.query<User & { password_hash: string; workspace_id: string; name: string; tier: string }>(
           `SELECT u.id, u.email, u.password_hash, u.workspace_id, w.name, w.tier
            FROM users u JOIN workspaces w ON w.id = u.workspace_id WHERE lower(u.email) = $1`, [body.email],
         )).rows[0];
         const valid = await verifyPassword(body.password, user?.password_hash ?? DUMMY_HASH);
         if (!valid || !user) {
-          limiter.fail(body.email, now());
           sendError(res, 401, 'invalid_credentials', 'invalid email or password');
           return;
         }

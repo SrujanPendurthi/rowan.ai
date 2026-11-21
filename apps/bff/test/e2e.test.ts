@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
@@ -73,7 +72,7 @@ test('browser session completes the core loop and revocation applies directly at
   const port = await freePort();
   const coreUrl = `http://127.0.0.1:${port}`;
   core = spawn(join(directory, 'core'), [], {
-    cwd: root, env: { ...env, ROWAN_PROVIDER: 'fake', PORT: String(port), ROWAN_ARTIFACT_DIR: directory },
+    cwd: root, env: { ...env, ROWAN_PROVIDER: 'registry', PORT: String(port), ROWAN_ARTIFACT_DIR: directory },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   core.on('error', (error: Error) => { spawnError = error; });
@@ -103,9 +102,9 @@ test('browser session completes the core loop and revocation applies directly at
   let run: EnrichmentRun | undefined;
   let runBody: { buy_box_id: string; candidates: typeof candidates };
   let creditsAfter = 0;
+  let runResponseBody = '';
   const candidates = [
-    { ref: 'cached', legal_name: 'Zephyr Plumbing LLC', state: 'OH' },
-    { ref: 'zero', legal_name: 'Orion Logistics Corp', state: 'OH' },
+    { ref: 'dbpr', legal_name: 'ACME HVAC LLC', state: 'FL', ids: { 'license:fl': 'CGC1520001' } },
   ];
   async function success<T>(response: Response, schema: z.ZodType<T>, status = 200): Promise<T> {
     const body: unknown = await response.json();
@@ -130,25 +129,13 @@ test('browser session completes the core loop and revocation applies directly at
       { cwd: root, env, timeout: 10_000, signal: t.signal });
     assert.equal((await success(await client.request('GET', '/api/v1/credits'), CreditsSchema)).total, 100);
 
-    // The standalone fake provider has no configured hits. Seed its cache using the Go
-    // SourceRecordInput wire shape so the real resolver/evaluator can produce a company.
-    const now = new Date().toISOString();
-    const payload = JSON.stringify([{
-      SourceSystem: 'fake', ExternalRef: 'e2e-company', Facts: { LegalName: candidates[0]!.legal_name, State: 'OH' },
-      FetchedAt: now, Citations: [
-        { field_name: 'state', field_value: 'OH', data_quality_status: 'verified_filing', export_policy: 'allow' },
-        { field_name: 'revenue_cents', field_value: 300000000, data_quality_status: 'commercial_estimate', export_policy: 'deal_team_plus' },
-      ].map((citation) => ({ ...citation, origin_type: 'raw_source', source_system: 'fake', source_ref: 'e2e', retrieved_at: now })),
-    }]);
-    const identityHash = createHash('sha256').update('zephyr plumbing|OH|').digest('hex');
-    await pool.query(`INSERT INTO source_fetch_cache(provider, cache_key, content_hash, payload, zero_hit, fetched_at)
-      VALUES ($1, $2, $3, $4, $5, $6)`,
-    ['fake', `${workspaceId}:${identityHash}`, createHash('sha256').update(payload).digest(), payload, false, now]);
+    await execute(join(directory, 'rowanctl'), ['load', 'dbpr', 'services/core/internal/registry/testdata/dbpr_construction.csv'],
+      { cwd: root, env, timeout: 10_000, signal: t.signal });
   });
   await t.test('buy box, discovery, quote, and enrichment use the typed contract', async () => {
     const buyBox = await success(await client.request('POST', '/api/v1/buy-boxes', {
       headers: { 'Idempotency-Key': 'bb-1' },
-      body: { name: 'OH HVAC', criteria: { states_in: ['OH'], revenue_min_cents: 200000000 } },
+      body: { name: 'FL HVAC', criteria: { states_in: ['FL'], revenue_min_cents: 200000000 } },
     }), BuyBoxSchema, 201);
     buyBoxId = buyBox.id;
     const discovery = await success(await client.request('POST', '/api/v1/discovery/search', {
@@ -158,30 +145,32 @@ test('browser session completes the core loop and revocation applies directly at
     const quote = await success(await client.request('POST', '/api/v1/enrichment/quote', { body: { candidates } }), QuoteSchema);
     assert.equal(quote.credits_required, 1);
     runBody = { buy_box_id: buyBoxId, candidates };
-    run = await success(await client.request('POST', '/api/v1/enrichment/run', {
+    const response = await client.request('POST', '/api/v1/enrichment/run', {
       body: runBody, headers: { 'Idempotency-Key': 'run-1' },
-    }), EnrichmentRunSchema);
+    });
+    runResponseBody = await response.clone().text();
+    run = await success(response, EnrichmentRunSchema);
     assert.equal(run.status, 'completed');
-    assert.equal(run.cached, 1);
-    assert.equal(run.zero_hits, 1);
-    assert.equal(run.credits_committed, 0);
-    assert.equal(run.credits_refunded, 1);
+    assert.equal(run.cached, 0);
+    assert.equal(run.hits, 1);
+    assert.equal(run.zero_hits, 0);
+    assert.equal(run.credits_committed, 1);
+    assert.equal(run.credits_refunded, 0);
     assert.equal(run.companies.length, 1);
   });
   await t.test('company, evaluations, review queue, credits, and CSV export', async () => {
     assert.ok(run);
     const company = await success(await client.request('GET', `/api/v1/companies/${run.companies[0]}`), CompanySchema);
-    assert.equal(company.citations.length, 2);
+    assert.ok(company.citations.some((citation) => citation.data_quality_status === 'verified_filing'));
     const evaluations = await success(await client.request('GET', `/api/v1/buy-boxes/${buyBoxId}/evaluations`), EvaluationsSchema);
     assert.equal(evaluations.evaluations.length, 1);
     const revenue = evaluations.evaluations[0]!.criteria_breakdown.find((criterion) => criterion.criterion === 'revenue_min_cents');
     assert.equal(revenue?.status, 'UNVERIFIED_LOW_CONFIDENCE');
-    assert.equal(revenue?.data_quality_status, 'commercial_estimate');
-    assert.equal(revenue?.observed, '[REDACTED]');
+    assert.equal(revenue?.data_quality_status, 'missing');
+    assert.equal(revenue?.observed, undefined);
     await success(await client.request('GET', '/api/v1/review-queue'), ReviewQueueSchema);
     creditsAfter = (await success(await client.request('GET', '/api/v1/credits'), CreditsSchema)).total;
-    // Fake lookups are zero-hit and cached hits are free; the reserved credit must be refunded.
-    assert.equal(creditsAfter, 100);
+    assert.equal(creditsAfter, 99);
     const exported = await client.request('POST', '/api/v1/exports', {
       body: { buy_box_id: buyBoxId, columns: ['state', 'revenue_cents'] }, headers: { 'Idempotency-Key': 'export-1' },
     });
@@ -191,15 +180,15 @@ test('browser session completes the core loop and revocation applies directly at
     assert.equal(exported.headers.get('Content-Disposition'), null);
     const csv = await exported.text();
     assert.match(csv, /revenue_cents__data_quality_status/);
-    assert.match(csv, /commercial_estimate/);
-    assert.match(csv, /\[REDACTED\]/);
-    assert.doesNotMatch(csv, /300000000/);
+    assert.match(csv, /verified_filing/);
+    assert.match(csv, /missing/);
   });
   await t.test('same enrichment key and body replay without changing credits', async () => {
     const replay = await client.request('POST', '/api/v1/enrichment/run', {
       body: runBody, headers: { 'Idempotency-Key': 'run-1' },
     });
     assert.equal(replay.headers.get('Idempotent-Replay'), 'true');
+    assert.equal(await replay.clone().text(), runResponseBody);
     assert.deepEqual(await success(replay, EnrichmentRunSchema), run);
     assert.equal((await success(await client.request('GET', '/api/v1/credits'), CreditsSchema)).total, creditsAfter);
   });

@@ -12,7 +12,7 @@ const httpURL = z.url({ protocol: /^https?$/ }).transform((value) => value.repla
 const envSchema = z.object({
   DATABASE_URL: z.url({ protocol: /^postgres(ql)?$/ }),
   ROWAN_CORE_URL: httpURL,
-  ROWAN_WEB_ORIGIN: httpURL,
+  ROWAN_WEB_ORIGIN: httpURL.refine((value) => new URL(value).origin === value, 'must be a canonical origin'),
   PORT: z.string().regex(/^\d+$/).transform(Number).pipe(z.number().int().min(1).max(65535)).default(8081),
   ROWAN_COOKIE_SECURE: z.enum(['true', 'false']).default('true').transform((value) => value === 'true'),
 });

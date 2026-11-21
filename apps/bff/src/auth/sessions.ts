@@ -20,6 +20,12 @@ export async function createSession(
     (workspace_id, user_id, key_hash, kind, label, monthly_spend_cap, rate_per_minute, expires_at, created_at)
     VALUES ($1, $2, $3, 'session', 'session', 9223372036854775807, 300, $4, $5)`,
   [workspaceId, userId, hashToken(token), expiresAt, now]);
+  await db.query(`UPDATE api_keys SET revoked_at = $2
+    WHERE id IN (
+      SELECT id FROM api_keys
+      WHERE user_id = $1 AND kind = 'session' AND revoked_at IS NULL AND expires_at > $2
+      ORDER BY created_at DESC, id DESC OFFSET 5
+    )`, [userId, now]);
   return { token, expiresAt };
 }
 

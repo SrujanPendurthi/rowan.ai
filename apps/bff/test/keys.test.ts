@@ -34,12 +34,14 @@ test('agent keys are scoped, hashed, listed without secrets, and revoked idempot
       body: { email, password: 'correct horse battery staple', workspace_name: 'Test' },
     });
     assert.equal(response.status, 201);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
     accounts.push(accountSchema.parse(await response.json()));
   }
   const account = accounts[0]!;
   const otherAccount = accounts[1]!;
   const response = await owner.request('POST', '/api/keys', { body: { label: ' agent-1 ', monthly_spend_cap: 500 } });
   assert.equal(response.status, 201);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
   const created = createdSchema.parse(await response.json());
   assert.match(created.token, /^rk_live_[A-Za-z0-9_-]{43}$/);
   assert.deepEqual(created.key, {
@@ -136,6 +138,7 @@ test('agent key bodies enforce trimmed labels and integer cap and rate bounds', 
       body: { label, monthly_spend_cap: cap, rate_per_minute: rate },
     });
     assert.equal(response.status, 201);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
     const created = createdSchema.parse(await response.json());
     assert.equal(created.key.label, label.trim());
     assert.equal(created.key.monthly_spend_cap, cap);

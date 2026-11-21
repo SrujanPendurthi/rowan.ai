@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
-import { IncomingMessage } from 'node:http';
+import { createServer, IncomingMessage, request } from 'node:http';
 import { Socket } from 'node:net';
 import test from 'node:test';
 import { readdir } from 'node:fs/promises';
 import { z } from 'zod';
+import { once } from 'node:events';
+import { createApp } from '../src/app.ts';
 import { loadConfig } from '../src/config.ts';
 import { BadRequestError, getCookie, parseJSON, PayloadTooLargeError, readBody } from '../src/http.ts';
 import { newTestDB } from './helpers/db.ts';
@@ -23,6 +25,7 @@ test('health, missing routes, and origin guard', async (t) => {
   assert.deepEqual(await health.json(), { ok: true });
   const missing = await client.request('GET', '/nope');
   assert.equal(missing.status, 404);
+  assert.equal(missing.headers.get('cache-control'), 'no-store');
   assert.deepEqual(await missing.json(), { error: { code: 'not_found', message: 'not found' } });
   for (const origin of [null, 'https://evil.example']) {
     const denied = await client.request('POST', '/api/anything', { origin });
@@ -86,4 +89,33 @@ test('HTTP helpers validate JSON, cookies, and body size boundary', async () => 
     if (size > 1_048_576) await assert.rejects(result, PayloadTooLargeError);
     else assert.equal((await result).length, size);
   }
+});
+
+test('GET // returns not_found for an invalid request URL', async (t) => {
+  const pool = await newTestDB(t);
+  const server = createServer(createApp({ pool, config: loadConfig(env) }));
+  t.after(() => new Promise<void>((resolve) => server.close(() => resolve())));
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  const response = await new Promise<{ status: number | undefined; body: string }>((resolve, reject) => {
+    const req = request({ host: '127.0.0.1', port: address.port, path: '//', method: 'GET' }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk: string) => { body += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  assert.equal(response.status, 404);
+  assert.deepEqual(JSON.parse(response.body), { error: { code: 'not_found', message: 'not found' } });
+});
+
+test('web origin rejects paths and noncanonical origins while core URL permits paths', () => {
+  for (const ROWAN_WEB_ORIGIN of ['http://localhost:3000/app', 'HTTP://Localhost:3000']) {
+    assert.throws(() => loadConfig({ ...env, ROWAN_WEB_ORIGIN }), /ROWAN_WEB_ORIGIN/);
+  }
+  assert.equal(loadConfig({ ...env, ROWAN_CORE_URL: 'http://localhost:8080/app/' }).coreUrl, 'http://localhost:8080/app');
 });

@@ -16,7 +16,7 @@ export class BadRequestError extends Error {
 }
 
 export function sendJSON(res: ServerResponse, status: number, body: unknown, headers?: Record<string, string>): void {
-  res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
+  res.writeHead(status, { 'Content-Type': 'application/json', ...headers, 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(body));
 }
 

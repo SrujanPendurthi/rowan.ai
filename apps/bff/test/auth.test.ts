@@ -44,6 +44,7 @@ test('signup, normalized login, transactional duplicates, logout, and absolute e
   assert.deepEqual(key.key_hash, createHash('sha256').update(oldCookie.slice('rowan_session='.length)).digest());
   const me = await client.request('GET', '/api/me');
   assert.equal(me.status, 200);
+  assert.equal(me.headers.get('cache-control'), 'no-store');
   assert.deepEqual(accountSchema.parse(await me.json()), account);
   assert.equal(account.user.email, 'founder@example.com');
   assert.equal(account.workspace.tier, 'solo');
@@ -122,4 +123,56 @@ test('limiter uses the oldest failure, expires at boundary, and resets', () => {
   assert.equal(limiter.check('email', new Date(start.getTime() + 900000)), 1);
   limiter.reset('email');
   assert.equal(limiter.check('email', start), 0);
+});
+
+test('concurrent wrong-password logins admit at most five attempts', async (t) => {
+  const pool = await newTestDB(t);
+  // Keep one DB socket for deterministic teardown; password verification still overlaps.
+  pool.options.max = 1;
+  const client = await startApp(t, { pool, config });
+  assert.equal((await client.request('POST', '/api/auth/signup', {
+    body: { email: 'concurrent@example.com', password, workspace_name: 'Concurrent' },
+  })).status, 201);
+  const responses = await Promise.all(Array.from({ length: 10 }, () => client.request('POST', '/api/auth/login', {
+    body: { email: 'concurrent@example.com', password: 'wrong password' },
+  })));
+  assert.equal(responses.filter((response) => response.status === 401).length, 5);
+  assert.equal(responses.filter((response) => response.status === 429).length, 5);
+});
+
+test('seven logins retain only the newest five live sessions', async (t) => {
+  const pool = await newTestDB(t);
+  let now = new Date('2026-11-21T12:00:00Z');
+  const client = await startApp(t, { pool, config, now: () => now });
+  const email = 'sessions@example.com';
+  const signup = await client.request('POST', '/api/auth/signup', { body: { email, password, workspace_name: 'Sessions' } });
+  const account = accountSchema.parse(await signup.json());
+  const cookies: string[] = [];
+  for (let i = 0; i < 7; i++) {
+    now = new Date(now.getTime() + 1000);
+    const login = await client.request('POST', '/api/auth/login', { body: { email, password } });
+    assert.equal(login.status, 200);
+    cookies.push(login.headers.get('set-cookie')!.split(';')[0]!);
+  }
+  const live = await pool.query(`SELECT id FROM api_keys WHERE user_id = $1 AND kind = 'session'
+    AND revoked_at IS NULL AND expires_at > $2`, [account.user.id, now]);
+  assert.equal(live.rowCount, 5);
+  for (const cookie of cookies.slice(0, 2)) {
+    assert.equal((await client.request('GET', '/api/me', { headers: { Cookie: cookie } })).status, 401);
+  }
+  assert.equal((await client.request('GET', '/api/me', { headers: { Cookie: cookies[6]! } })).status, 200);
+});
+
+test('limiter prunes stale emails above the entry threshold and retains recent failures', () => {
+  const limiter = new LoginLimiter(2);
+  const start = new Date('2026-11-21T12:00:00Z');
+  limiter.fail('stale', start);
+  const now = new Date(start.getTime() + 900001);
+  for (let i = 0; i < 5; i++) limiter.fail('recent', now);
+  limiter.fail('new', now);
+  const entries: unknown = Reflect.get(limiter, 'failures');
+  assert.ok(entries instanceof Map);
+  assert.equal(entries.size, 2);
+  assert.equal(entries.has('stale'), false);
+  assert.equal(limiter.check('recent', now), 900);
 });

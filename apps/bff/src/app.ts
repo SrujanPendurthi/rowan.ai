@@ -23,7 +23,13 @@ export function createApp(deps: Deps): http.RequestListener {
   ];
   return (req, res) => {
     void (async () => {
-      const path = new URL(req.url ?? '/', 'http://localhost').pathname;
+      let path: string;
+      try {
+        path = new URL(req.url ?? '/', 'http://localhost').pathname;
+      } catch {
+        sendError(res, 404, 'not_found', 'not found');
+        return;
+      }
       if ((path === '/api' || path.startsWith('/api/')) && req.method !== 'GET' && req.method !== 'HEAD'
           && !checkOrigin(req, deps.config.webOrigin)) {
         sendError(res, 403, 'origin_forbidden', 'origin forbidden');
