@@ -366,24 +366,6 @@ func TestInsertSignalsDedupeKey(t *testing.T) {
 	}
 }
 
-func TestLoadDuplicateRefs(t *testing.T) {
-	pool := testdb.New(t)
-	e := entities(1)[0]
-	changed := e
-	changed.Facts.Principal = "New Principal"
-	calls := 0
-	stats, err := Load(context.Background(), pool, loadMeta(), sliceNext([]Entity{e, changed, changed}), func(old, new Entity, meta LoadMeta) []Signal {
-		calls++
-		if old.Facts.Principal != e.Facts.Principal || new.Facts.Principal != changed.Facts.Principal {
-			t.Errorf("duplicate diff = %+v -> %+v", old, new)
-		}
-		return []Signal{changeSignal(new, meta)}
-	})
-	if err != nil || stats.Read != 3 || stats.Inserted != 1 || stats.Updated != 1 || stats.Unchanged != 1 || stats.Signals != 1 || calls != 1 {
-		t.Fatalf("duplicate load = %+v, %v; calls=%d", stats, err, calls)
-	}
-}
-
 func TestLoadSkipsMissingIdentity(t *testing.T) {
 	pool := testdb.New(t)
 	rows := entities(4)

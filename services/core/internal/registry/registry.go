@@ -20,6 +20,8 @@ type Entity struct {
 	Raw             map[string]string    `json:"raw"`
 	SourceUpdatedAt *time.Time           `json:"source_updated_at"`
 	Line            int                  `json:"line,omitempty"`
+	// Tombstone asks Load to delete the stored row instead of upserting it.
+	Tombstone bool `json:"-"`
 }
 
 type Signal struct {

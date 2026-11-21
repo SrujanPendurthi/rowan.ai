@@ -89,7 +89,24 @@ func loadBatch(ctx context.Context, pool *pgxpool.Pool, meta LoadMeta, entities 
 		}
 		batch := &pgx.Batch{}
 		changes := make([]change, 0, len(entities))
-		for _, e := range entities {
+		// Within a batch the last occurrence of a key wins; earlier ones are skipped.
+		last := make(map[entityKey]int, len(entities))
+		for i, e := range entities {
+			last[entityKey{e.SourceSystem, e.ExternalRef}] = i
+		}
+		var deleteSources, deleteRefs []string
+		for i, e := range entities {
+			if last[entityKey{e.SourceSystem, e.ExternalRef}] != i {
+				stats.Skipped++
+				continue
+			}
+			if e.Tombstone {
+				stats.Skipped++
+				if strings.TrimSpace(e.ExternalRef) != "" {
+					deleteSources, deleteRefs = append(deleteSources, e.SourceSystem), append(deleteRefs, e.ExternalRef)
+				}
+				continue
+			}
 			names := normalizedNames(e)
 			// Missing identities cannot support registry lookup or resolution.
 			if strings.TrimSpace(e.ExternalRef) == "" || strings.TrimSpace(e.Facts.LegalName) == "" || len(names) == 0 {
@@ -135,8 +152,12 @@ func loadBatch(ctx context.Context, pool *pgxpool.Pool, meta LoadMeta, entities 
 				e.SourceSystem, e.ExternalRef, e.Facts.LegalName, names, e.Facts.State, e.Facts.Zip,
 				idsJSON, encoded, hash[:], meta.FileName, meta.SnapshotRef, e.SourceUpdatedAt, meta.LoadedAt)
 			changes = append(changes, change{old: old.entity, new: e, existed: existed})
-			// Duplicate keys in one batch observe earlier rows from that batch.
-			stored[key] = storedEntity{hash: hash[:], entity: e}
+		}
+		if len(deleteRefs) > 0 {
+			if _, err := tx.Exec(ctx, `DELETE FROM registry_entities WHERE (source_system, external_ref) IN
+				(SELECT * FROM unnest($1::text[], $2::text[]))`, deleteSources, deleteRefs); err != nil {
+				return fmt.Errorf("delete registry entities: %w", err)
+			}
 		}
 		if len(changes) == 0 {
 			return nil

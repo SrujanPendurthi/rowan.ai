@@ -46,8 +46,9 @@ const (
 )
 
 // LoadSAM loads a public monthly V2 extract, selecting the first .dat in a ZIP.
-// Read includes successfully parsed data records, including NPDY skips; framing
-// lines and malformed records are excluded. Mutation counts cover committed batches.
+// Read includes successfully parsed data records, including NPDY records; framing
+// lines and malformed records are excluded. NPDY records delete any stored row
+// for that UEI and count as Skipped. Mutation counts cover committed batches.
 func LoadSAM(ctx context.Context, pool *pgxpool.Pool, path, snapshotRef string, now time.Time) (stats LoadStats, err error) {
 	reader, closeFile, err := openSAM(path)
 	if err != nil {
@@ -85,7 +86,6 @@ func LoadSAM(ctx context.Context, pool *pgxpool.Pool, path, snapshotRef string, 
 	if !ok || !strings.HasPrefix(scanner.Text(), "BOF PUBLIC") {
 		return stats, fmt.Errorf("SAM line 1: expected BOF PUBLIC: %w", ErrUnknownFormat)
 	}
-	skipped := 0
 	next := func() (Entity, bool, error) {
 		for {
 			ok, err := scan()
@@ -106,7 +106,7 @@ func LoadSAM(ctx context.Context, pool *pgxpool.Pool, path, snapshotRef string, 
 				}
 				return Entity{}, false, nil
 			}
-			fields := strings.Split(scanner.Text(), "|")
+			fields := strings.Split(strings.ToValidUTF8(scanner.Text(), ""), "|")
 			for i := range fields {
 				fields[i] = strings.TrimSpace(fields[i])
 			}
@@ -120,8 +120,10 @@ func LoadSAM(ctx context.Context, pool *pgxpool.Pool, path, snapshotRef string, 
 				return Entity{}, false, fmt.Errorf("SAM line %d: missing !end field: %w", line, ErrUnknownFormat)
 			}
 			if fields[samNoPublicDisplayColumn-1] == "NPDY" {
-				skipped++
-				continue
+				// Tombstone removes a row stored while the entity was public.
+				// ponytail: copies already in workspace source_records are not purged; add a retention job.
+				_, uei := NormID("uei", fields[samUEIColumn-1])
+				return Entity{SourceSystem: "sam", ExternalRef: uei, Tombstone: true}, true, nil
 			}
 			e, err := samEntity(fields, line)
 			return e, err == nil, err
@@ -129,10 +131,7 @@ func LoadSAM(ctx context.Context, pool *pgxpool.Pool, path, snapshotRef string, 
 	}
 	meta := LoadMeta{SourceSystem: "sam", TableName: "sam_public_v2", FileName: filepath.Base(path),
 		SnapshotRef: snapshotRef, LoadedAt: now}
-	stats, err = Load(ctx, pool, meta, next, nil)
-	stats.Read += skipped
-	stats.Skipped += skipped
-	return stats, err
+	return Load(ctx, pool, meta, next, nil)
 }
 
 func openSAM(path string) (io.Reader, func() error, error) {

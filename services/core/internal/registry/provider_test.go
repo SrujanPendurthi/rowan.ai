@@ -159,11 +159,4 @@ func TestRegistryEnrichAutoMerge(t *testing.T) {
 		}
 		t.Fatalf("companies=%d links=%d committed=%d res=%+v", companies, links, committed, res)
 	}
-	rows, _ := pool.Query(ctx, `SELECT merge_confidence_score, match_reasons FROM entity_merge_links ORDER BY created_at`)
-	for rows.Next() {
-		var s float64
-		var r []string
-		_ = rows.Scan(&s, &r)
-		t.Logf("link %.3f %v", s, r)
-	}
 }

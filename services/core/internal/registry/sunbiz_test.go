@@ -253,7 +253,7 @@ func TestLoadSunbizLineBoundaries(t *testing.T) {
 	pool := testdb.New(t)
 	rows := sunbizFixtureRows(false)
 	// Longer lines, CRLF, and a final line without a newline preserve physical lines.
-	data := rows[0] + strings.Repeat("x", 70000) + "\r\n" + rows[1] + "\r\n" + rows[2]
+	data := rows[0] + strings.Repeat("x", 60000) + "\r\n" + rows[1] + "\r\n" + rows[2]
 	stats, err := LoadSunbizCorp(context.Background(), pool, sunbizTempFile(t, data), "snapshot", sunbizLoadTime)
 	if err != nil || stats.Inserted != 3 {
 		t.Fatalf("boundary load = %+v, %v", stats, err)

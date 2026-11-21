@@ -108,7 +108,7 @@ func citations(system, file string, loaded time.Time, e Entity) []quality.Citati
 		{"legal_name", f.LegalName}, {"dba", f.DBA}, {"address", f.Address1}, {"zip", f.Zip}, {"state", f.State},
 		{"principal", f.Principal}, {"registered_agent", f.RegisteredAgent}, {"domain", f.Domain},
 	}
-	for _, k := range []string{"primary_naics", "status"} {
+	for _, k := range []string{"primary_naics", "status", "primary_status"} {
 		if v, ok := e.Extra[k].(string); ok {
 			fields = append(fields, struct{ name, value string }{k, v})
 		}

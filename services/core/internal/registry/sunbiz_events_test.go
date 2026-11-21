@@ -172,7 +172,7 @@ func TestLoadSunbizEventsFieldsAndLines(t *testing.T) {
 	nameChange := eventField(rows[2], 38, 40, "AMENDMENT")
 	nameChange = eventField(nameChange, 413, 1, "Y")
 	// Long records and the final missing newline must retain physical line numbers.
-	path := eventTempFile(t, row+strings.Repeat("x", 70000)+"\r\n"+rows[3]+"\r\n"+nameChange)
+	path := eventTempFile(t, row+strings.Repeat("x", 60000)+"\r\n"+rows[3]+"\r\n"+nameChange)
 	stats, err := LoadSunbizEvents(context.Background(), pool, path, "snapshot", sunbizLoadTime)
 	if err != nil || stats.Read != 3 || stats.Signals != 2 || stats.Unmapped != 1 {
 		t.Fatalf("fields = %+v, %v", stats, err)

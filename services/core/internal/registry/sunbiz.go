@@ -41,18 +41,14 @@ func LoadSunbizCorp(ctx context.Context, pool *pgxpool.Pool, path, snapshotRef s
 			err = errors.Join(err, fmt.Errorf("close Sunbiz corporate extract: %w", closeErr))
 		}
 	}()
-	reader := bufio.NewReader(file)
+	scanner := newLineScanner(file)
 	line := 0
 	next := func() (Entity, bool, error) {
-		row, err := reader.ReadString('\n')
-		if err != nil && !errors.Is(err, io.EOF) {
-			return Entity{}, false, fmt.Errorf("Sunbiz line %d: %w", line+1, err)
-		}
-		if len(row) == 0 && errors.Is(err, io.EOF) {
-			return Entity{}, false, nil
+		if !scanner.Scan() {
+			return Entity{}, false, scanErr(scanner, "Sunbiz", line)
 		}
 		line++
-		row = strings.TrimSuffix(strings.TrimSuffix(row, "\n"), "\r")
+		row := scanner.Text()
 		if len(row) < sunbizCorpRecordBytes {
 			return Entity{}, false, fmt.Errorf("Sunbiz line %d: got %d bytes, need at least %d", line, len(row), sunbizCorpRecordBytes)
 		}
@@ -61,6 +57,26 @@ func LoadSunbizCorp(ctx context.Context, pool *pgxpool.Pool, path, snapshotRef s
 	meta := LoadMeta{SourceSystem: "fl_sunbiz", TableName: "cordata", FileName: filepath.Base(path),
 		SnapshotRef: snapshotRef, LoadedAt: now}
 	return Load(ctx, pool, meta, next, sunbizDiff)
+}
+
+const maxLineBytes = 64 << 10
+
+func newLineScanner(r io.Reader) *bufio.Scanner {
+	s := bufio.NewScanner(r)
+	s.Buffer(make([]byte, 0, 4096), maxLineBytes)
+	return s
+}
+
+// scanErr reports the failure after a false Scan; nil means clean EOF.
+func scanErr(s *bufio.Scanner, kind string, line int) error {
+	err := s.Err()
+	if errors.Is(err, bufio.ErrTooLong) {
+		return fmt.Errorf("%s line %d: line too long", kind, line+1)
+	}
+	if err != nil {
+		return fmt.Errorf("%s line %d: %w", kind, line+1, err)
+	}
+	return nil
 }
 
 func parseSunbizDate(s string) *time.Time {
@@ -85,7 +101,9 @@ func parseSunbizDate(s string) *time.Time {
 }
 
 func sunbizCorpEntity(row string, line int) Entity {
-	field := func(start, length int) string { return strings.TrimSpace(row[start-1 : start-1+length]) }
+	field := func(start, length int) string {
+		return strings.TrimSpace(strings.ToValidUTF8(row[start-1:start-1+length], ""))
+	}
 	raw := map[string]string{
 		"doc_number": field(1, 12), "legal_name": field(13, 192),
 		"status": field(205, 1), "filing_type": field(206, 15),

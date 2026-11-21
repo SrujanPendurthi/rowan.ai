@@ -1,11 +1,9 @@
 package registry
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -65,7 +63,7 @@ func LoadSunbizEvents(ctx context.Context, pool *pgxpool.Pool, path, snapshotRef
 	}()
 	meta := LoadMeta{SourceSystem: "fl_sunbiz", TableName: "corevent", FileName: filepath.Base(path),
 		SnapshotRef: snapshotRef, LoadedAt: now}
-	reader := bufio.NewReader(file)
+	scanner := newLineScanner(file)
 	line := 0
 	for {
 		signals := make([]Signal, 0, batchSize)
@@ -74,15 +72,14 @@ func LoadSunbizEvents(ctx context.Context, pool *pgxpool.Pool, path, snapshotRef
 			if err := ctx.Err(); err != nil {
 				return stats, fmt.Errorf("Sunbiz event load: %w", err)
 			}
-			row, err := reader.ReadString('\n')
-			if err != nil && !errors.Is(err, io.EOF) {
-				return stats, fmt.Errorf("Sunbiz event line %d: %w", line+1, err)
-			}
-			if len(row) == 0 && errors.Is(err, io.EOF) {
+			if !scanner.Scan() {
+				if err := scanErr(scanner, "Sunbiz event", line); err != nil {
+					return stats, err
+				}
 				break
 			}
 			line++
-			row = strings.TrimSuffix(strings.TrimSuffix(row, "\n"), "\r")
+			row := scanner.Text()
 			if len(row) < sunbizEventRecordBytes {
 				return stats, fmt.Errorf("Sunbiz event line %d: got %d bytes, need at least %d", line, len(row), sunbizEventRecordBytes)
 			}
@@ -124,6 +121,9 @@ func sunbizEventSignal(row string, line int, meta LoadMeta) (Signal, string, boo
 		return Signal{}, strings.ToUpper(desc), false
 	}
 	_, ref := NormID("filing:fl", field(1, 12))
+	if ref == "" {
+		return Signal{}, strings.ToUpper(desc), false
+	}
 	entity := Entity{ExternalRef: ref, Line: line}
 	// Sequence participates in InsertSignals' citation-value hash, preserving
 	// distinct same-document events of the same type filed on the same day.
