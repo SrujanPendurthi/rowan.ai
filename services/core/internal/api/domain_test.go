@@ -57,8 +57,8 @@ func TestCompanyResponseHasProvenance(t *testing.T) {
 	if body["id"] != id || body["display_name"] != "Zephyr Plumbing LLC" || body["pending_review"] != false {
 		t.Fatalf("company = %v", body)
 	}
-	if v, ok := body["proxy_summary"]; !ok || v != nil {
-		t.Fatalf("proxy_summary = %v, %v", v, ok)
+	if v, _ := body["proxy_summary"].(map[string]any); v == nil || v["label"] != "none" {
+		t.Fatalf("proxy_summary = %v", body["proxy_summary"])
 	}
 	citations, _ := body["citations"].([]any)
 	if len(citations) < 2 {

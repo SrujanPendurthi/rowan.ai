@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"rowan.ai/rowan/services/core/internal/evaluate"
+	"rowan.ai/rowan/services/core/internal/proxy"
 	"rowan.ai/rowan/services/core/internal/quality"
 )
 
@@ -106,6 +107,9 @@ func Split(ctx context.Context, tx pgx.Tx, canonicalID string, sourceRecordIDs [
 		}
 		if err := evaluate.ReevaluateCompany(ctx, tx, id, now); err != nil {
 			return "", fmt.Errorf("reevaluate split company: %w", err)
+		}
+		if _, err := proxy.Recompute(ctx, tx, id, now); err != nil {
+			return "", fmt.Errorf("recompute split proxy: %w", err)
 		}
 	}
 	return newID, nil

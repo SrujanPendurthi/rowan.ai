@@ -19,6 +19,7 @@ import (
 	"rowan.ai/rowan/services/core/internal/db"
 	"rowan.ai/rowan/services/core/internal/enrich"
 	"rowan.ai/rowan/services/core/internal/ledger"
+	"rowan.ai/rowan/services/core/internal/proxy"
 	"rowan.ai/rowan/services/core/internal/registry"
 )
 
@@ -95,13 +96,24 @@ func run(ctx context.Context) error {
 func sweep(ctx context.Context, pool *pgxpool.Pool) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+	proxyTicker := time.NewTicker(24 * time.Hour)
+	defer proxyTicker.Stop()
+	recomputeProxies(ctx, pool)
 	for {
 		sweepOnce(ctx, pool)
 		select {
 		case <-ctx.Done():
 			return
+		case <-proxyTicker.C:
+			recomputeProxies(ctx, pool)
 		case <-ticker.C:
 		}
+	}
+}
+
+func recomputeProxies(ctx context.Context, pool *pgxpool.Pool) {
+	if _, err := proxy.RecomputeAll(ctx, pool, time.Now()); err != nil {
+		log.Printf("recompute proxy summaries: %v", err)
 	}
 }
 

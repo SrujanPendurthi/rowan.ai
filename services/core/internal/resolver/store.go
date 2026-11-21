@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"rowan.ai/rowan/services/core/internal/evaluate"
+	"rowan.ai/rowan/services/core/internal/proxy"
 	"rowan.ai/rowan/services/core/internal/quality"
 )
 
@@ -97,6 +98,17 @@ func LockWorkspace(ctx context.Context, tx pgx.Tx, workspaceID string) error {
 // Existing links survive content changes, preserving rejection and split history.
 // It takes the workspace row lock; callers must acquire it before any ledger or source_fetch_cache row locks in the same tx.
 func Resolve(ctx context.Context, tx pgx.Tx, in SourceRecordInput, now time.Time) (ResolveResult, error) {
+	result, err := resolve(ctx, tx, in, now)
+	if err != nil {
+		return ResolveResult{}, err
+	}
+	if _, err := proxy.Recompute(ctx, tx, result.CanonicalID, now); err != nil {
+		return ResolveResult{}, fmt.Errorf("recompute proxy after resolve: %w", err)
+	}
+	return result, nil
+}
+
+func resolve(ctx context.Context, tx pgx.Tx, in SourceRecordInput, now time.Time) (ResolveResult, error) {
 	if in.WorkspaceID == "" || in.SourceSystem == "" || in.ExternalRef == "" {
 		return ResolveResult{}, fmt.Errorf("resolve record: %w", ErrInvalidRequest)
 	}
@@ -389,6 +401,12 @@ func ResolveReview(ctx context.Context, tx pgx.Tx, candidateID, action, actor st
 	if action == "merge" {
 		if err := cleanMergedCompany(ctx, tx, oldID, c.targetID, c.id, now); err != nil {
 			return err
+		}
+		// oldID may be deleted above; Recompute no-ops on a missing row.
+		for _, id := range []string{oldID, c.targetID} {
+			if _, err := proxy.Recompute(ctx, tx, id, now); err != nil {
+				return fmt.Errorf("recompute proxy after review merge: %w", err)
+			}
 		}
 		if err := evaluate.ReevaluateCompany(ctx, tx, c.targetID, now); err != nil {
 			return fmt.Errorf("reevaluate review target: %w", err)
