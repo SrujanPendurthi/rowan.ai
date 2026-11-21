@@ -19,6 +19,7 @@ import (
 	"rowan.ai/rowan/services/core/internal/db"
 	"rowan.ai/rowan/services/core/internal/enrich"
 	"rowan.ai/rowan/services/core/internal/ledger"
+	"rowan.ai/rowan/services/core/internal/registry"
 )
 
 func main() {
@@ -30,14 +31,6 @@ func main() {
 }
 
 func run(ctx context.Context) error {
-	var provider enrich.Provider
-	switch os.Getenv("ROWAN_PROVIDER") {
-	case "fake":
-		provider = &enrich.FakeProvider{}
-	default:
-		// Real providers arrive in Plan 4.
-		return errors.New("no provider configured: set ROWAN_PROVIDER=fake")
-	}
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		log.Fatal("DATABASE_URL is required")
@@ -49,6 +42,15 @@ func run(ctx context.Context) error {
 	defer pool.Close()
 	if err := db.Migrate(ctx, pool); err != nil {
 		return err
+	}
+	var provider enrich.Provider
+	switch os.Getenv("ROWAN_PROVIDER") {
+	case "fake":
+		provider = &enrich.FakeProvider{}
+	case "registry":
+		provider = &registry.Provider{Pool: pool, MaxPerSource: 3}
+	default:
+		return errors.New("no provider configured: set ROWAN_PROVIDER=registry or fake")
 	}
 	artifactDir := os.Getenv("ROWAN_ARTIFACT_DIR")
 	if artifactDir == "" {
