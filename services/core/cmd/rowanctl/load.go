@@ -26,6 +26,8 @@ import (
 var (
 	dbprBase = "https://www2.myfloridalicense.com"
 	samBase  = "https://api.sam.gov"
+
+	recompute = proxy.RecomputeForRefs
 )
 
 const (
@@ -60,11 +62,16 @@ var loaders = map[string]loader{
 // loadFile loads path with ld, recomputes proxy summaries for refs with new signals, and prints one JSON line.
 func loadFile(ctx context.Context, pool *pgxpool.Pool, ld loader, path, snapshotRef string, out io.Writer, now func() time.Time) error {
 	stats, system, refs, err := ld(ctx, pool, path, snapshotRef, now())
-	if err != nil {
-		return fmt.Errorf("load %s: %w", path, err)
+	// Earlier committed batches may have signals even when the load failed.
+	_, recomputeErr := recompute(ctx, pool, system, refs, now())
+	if recomputeErr != nil {
+		recomputeErr = fmt.Errorf("recompute proxy: %w", recomputeErr)
 	}
-	if _, err := proxy.RecomputeForRefs(ctx, pool, system, refs, now()); err != nil {
-		return fmt.Errorf("recompute proxy: %w", err)
+	if err != nil {
+		return errors.Join(fmt.Errorf("load %s: %w", path, err), recomputeErr)
+	}
+	if recomputeErr != nil {
+		return recomputeErr
 	}
 	return json.NewEncoder(out).Encode(stats)
 }
@@ -131,6 +138,9 @@ func fetchCmd(ctx context.Context, pool *pgxpool.Pool, args []string, out io.Wri
 		dir = "./data/snapshots"
 	}
 	f := &fetch.Fetcher{Pool: pool, SnapshotDir: dir, Now: now}
+	if args[0] == "sam" {
+		f.MaxRetries = 1 // the personal SAM key allows 10 requests/day; retries burn it
+	}
 	for _, t := range targets {
 		res, err := f.Get(ctx, t.url) // error already names the redacted URL
 		if err != nil {

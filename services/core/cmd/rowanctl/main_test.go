@@ -5,12 +5,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"rowan.ai/rowan/services/core/internal/api"
 	"rowan.ai/rowan/services/core/internal/ledger"
@@ -157,5 +161,46 @@ func TestFetchSAMLoads(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "secret") {
 		t.Fatal("key leaked")
+	}
+}
+
+func TestFetchSAMRetriesOnce(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	old := samBase
+	samBase = srv.URL
+	defer func() { samBase = old }()
+	t.Setenv("SAM_API_KEY", "secret")
+	t.Setenv("ROWAN_SNAPSHOT_DIR", t.TempDir())
+	err := run(context.Background(), testdb.New(t), []string{"fetch", "sam", "--month", "11/2026"}, &bytes.Buffer{}, time.Now)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("hits = %d, want 2 (one retry)", got)
+	}
+}
+
+func TestLoadFileRecomputesAfterLoaderError(t *testing.T) {
+	var gotRefs []string
+	old := recompute
+	recompute = func(_ context.Context, _ *pgxpool.Pool, system string, refs []string, _ time.Time) (int, error) {
+		gotRefs = refs
+		return 0, errors.New("recompute boom")
+	}
+	defer func() { recompute = old }()
+	ld := func(context.Context, *pgxpool.Pool, string, string, time.Time) (any, string, []string, error) {
+		return nil, "sam", []string{"U1"}, errors.New("load boom")
+	}
+	err := loadFile(context.Background(), nil, ld, "f.dat", "ref", &bytes.Buffer{}, time.Now)
+	if len(gotRefs) != 1 || gotRefs[0] != "U1" {
+		t.Fatalf("recompute refs = %v", gotRefs)
+	}
+	if err == nil || !strings.Contains(err.Error(), "load boom") || !strings.Contains(err.Error(), "recompute boom") {
+		t.Fatalf("err = %v", err)
 	}
 }
