@@ -54,8 +54,8 @@ One credit per billable lookup; zero-hit and failed lookups are refunded. Other 
 
 - The `Idempotency-Key` namespace is per workspace: keys are shared across all API keys in a workspace.
 - Stored responses replay for the same key and body. A different body under the same key returns `409`.
-- Every 4xx response is stored for replay, except `402 insufficient_credits` and `403 spend_cap_exceeded`. After fixing a stored 4xx (for example `400`), send a new key with the changed request.
-- `402`/`403` are not stored, so the same key and body succeeds after a top-up or a raised cap, and is charged once.
+- Responses not stored under an idempotency key are: `402`, `403 spend_cap_exceeded`, `409 request_in_progress`, and `409 idempotency_key_reuse`; all other 4xx are stored. After fixing a stored 4xx (for example `400`), send a new key with the changed request.
+- `402` and `403 spend_cap_exceeded` are not stored, so the same key and body succeeds after a top-up or a raised cap, and is charged once.
 - A run takes at most 500 distinct candidate refs (`400 invalid_request` above that). Candidates sharing one identity are looked up and billed once.
-- A run that stops early (timeout or provider rate-limit error) is stored with `"status": "partial"` and an `"unprocessed"` count; credits for unprocessed candidates are refunded.
+- A run that stops early (timeout or provider rate-limit error) returns HTTP `200` once persisted, with `"status": "partial"` and an `"unprocessed"` count; credits for unprocessed candidates are refunded. The same key and body replay the stored response.
 - JSON responses apply the same tier `export_policy` gating as CSV exports: gated `field_value`, criterion `observed`, and `display_name` are `"[REDACTED]"`.

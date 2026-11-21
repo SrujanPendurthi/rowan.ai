@@ -85,5 +85,6 @@ func (s *server) enrichRun(c *call) (response, error) {
 	if err != nil {
 		return response{}, err
 	}
+	// Persisted partial runs are successful responses and are stored for idempotent replay.
 	return jsonResponse(200, res), nil
 }

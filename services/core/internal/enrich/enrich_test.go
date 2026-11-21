@@ -387,8 +387,8 @@ func TestRunLimiterStopSettlesPartial(t *testing.T) {
 	svc := newService(pool, p)
 	svc.Limiter = rate.NewLimiter(rate.Every(time.Hour), 1)
 	res, err := svc.Run(context.Background(), ws, "", "k", "", cs)
-	if err == nil {
-		t.Fatal("want limiter error")
+	if err != nil {
+		t.Fatalf("persisted partial run returned error: %v", err)
 	}
 	if res.Hits != 1 || res.Unprocessed != 3 || res.Status != "partial" || res.CreditsCommitted != 1 || res.CreditsRefunded != 3 || p.Calls.Load() != 1 {
 		t.Fatalf("RunResult = %+v calls=%d", res, p.Calls.Load())

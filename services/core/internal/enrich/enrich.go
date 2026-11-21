@@ -457,5 +457,6 @@ func (s *Service) finish(ctx context.Context, res RunResult, companies map[strin
 	if err != nil {
 		return res, fmt.Errorf("enrich: finalize run: %w", err)
 	}
-	return res, runErr
+	// A persisted result is authoritative; an interrupted run is represented by its status.
+	return res, nil
 }

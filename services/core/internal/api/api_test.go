@@ -8,6 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/time/rate"
+
+	"rowan.ai/rowan/services/core/internal/enrich"
 	"rowan.ai/rowan/services/core/internal/ledger"
 )
 
@@ -108,6 +111,42 @@ func TestIdempotencyReplay(t *testing.T) {
 	}
 	if got := e.available(ws); got != 498 {
 		t.Fatalf("available = %d, want 498 (one charge)", got)
+	}
+	if err := ledger.CheckInvariants(t.Context(), e.pool, ws); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEnrichRunPartialReturns200(t *testing.T) {
+	e := newEnv(t)
+	ws, _, token := e.tenant(ledger.Solo)
+	cs := candidates(3)
+	e.provide(cs)
+	// Run detaches request cancellation. A second token beyond runTimeout stops it after one hit.
+	svc := &enrich.Service{Pool: e.pool, Provider: e.provider, Limiter: rate.NewLimiter(rate.Every(time.Hour), 1),
+		CacheTTL: 30 * 24 * time.Hour, Now: e.clock}
+	e.h = New(Deps{Pool: e.pool, Enrich: svc, ArtifactDir: e.dir, Now: e.clock})
+	first := e.run(token, "partial", cs, "")
+	wantStatus(t, first, 200)
+	body := decode(t, first)
+	runID := str(t, body, "run_id")
+	if body["status"] != "partial" || body["unprocessed"] != float64(2) || body["hits"] != float64(1) ||
+		body["credits_committed"] != float64(1) || body["credits_refunded"] != float64(2) {
+		t.Fatalf("partial result = %v", body)
+	}
+	if status := scalar[string](t, e.pool, `SELECT status FROM enrichment_runs WHERE id=$1`, runID); status != "partial" {
+		t.Fatalf("stored status = %q, want partial", status)
+	}
+	second := e.run(token, "partial", cs, "")
+	wantStatus(t, second, 200)
+	if second.Header().Get("Idempotent-Replay") != "true" || second.Body.String() != first.Body.String() {
+		t.Fatalf("replay differs: %q vs %q (%v)", second.Body.String(), first.Body.String(), second.Header())
+	}
+	if calls := e.provider.Calls.Load(); calls != 1 {
+		t.Fatalf("provider calls = %d, want 1", calls)
+	}
+	if got := e.available(ws); got != 499 {
+		t.Fatalf("available = %d, want 499 (one charge)", got)
 	}
 	if err := ledger.CheckInvariants(t.Context(), e.pool, ws); err != nil {
 		t.Fatal(err)
