@@ -95,7 +95,7 @@ func LoadSAM(ctx context.Context, pool *pgxpool.Pool, path, snapshotRef string, 
 			if !ok {
 				return Entity{}, false, fmt.Errorf("SAM line %d: missing EOF: %w", line+1, ErrUnknownFormat)
 			}
-			if strings.HasPrefix(scanner.Text(), "EOF") {
+			if strings.HasPrefix(scanner.Text(), "EOF") && !strings.Contains(scanner.Text(), "|") {
 				// Consume the stream to validate the trailer and ZIP checksum.
 				ok, err := scan()
 				if err != nil {

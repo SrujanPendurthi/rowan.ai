@@ -110,6 +110,42 @@ func TestLoadSAMFixture(t *testing.T) {
 	assertSAMFixture(t, testdb.New(t), "testdata/sam_public_v2.dat")
 }
 
+func TestLoadSAMEOFUEI(t *testing.T) {
+	pool := testdb.New(t)
+	data := strings.Replace(samFixture(t), "ABCDEF123456", "EOFABC123456", 1)
+	stats, err := LoadSAM(context.Background(), pool, samTempFile(t, data), "snapshot", samLoadTime)
+	if err != nil || stats.Read != 4 || stats.Inserted != 3 || stats.Skipped != 1 {
+		t.Fatalf("EOF-prefixed UEI load = %+v, %v", stats, err)
+	}
+	var e Entity
+	if err := pool.QueryRow(context.Background(), `SELECT entity FROM registry_entities
+		WHERE source_system = 'sam' AND external_ref = 'EOFABC123456'`).Scan(&e); err != nil {
+		t.Fatal(err)
+	}
+	if e.ExternalRef != "EOFABC123456" || e.Facts.IDs["uei"] != "EOFABC123456" ||
+		e.Facts.LegalName != "ACME HVAC LLC" || e.Line != 2 {
+		t.Fatalf("EOF-prefixed UEI entity = %+v", e)
+	}
+}
+
+func TestLoadSAMBlankUEI(t *testing.T) {
+	pool := testdb.New(t)
+	data := strings.Replace(samFixture(t), "ABCDEF123456", "   ", 1)
+	stats, err := LoadSAM(context.Background(), pool, samTempFile(t, data), "snapshot", samLoadTime)
+	if err != nil || stats.Read != 4 || stats.Inserted != 2 || stats.Skipped != 2 {
+		t.Fatalf("blank UEI load = %+v, %v", stats, err)
+	}
+	var total, blankEntity int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*),
+		count(*) FILTER (WHERE btrim(external_ref) = '' OR legal_name = 'ACME HVAC LLC')
+		FROM registry_entities WHERE source_system = 'sam'`).Scan(&total, &blankEntity); err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || blankEntity != 0 {
+		t.Fatalf("stored rows = %d, blank-UEI entity rows = %d", total, blankEntity)
+	}
+}
+
 func TestLoadSAMZip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sam_public_v2.zip")
 	file, err := os.Create(path)
