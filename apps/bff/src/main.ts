@@ -5,6 +5,9 @@ import { loadConfig } from './config.ts';
 
 const config = loadConfig(process.env);
 const pool = new pg.Pool({ connectionString: config.databaseUrl });
+pool.on('error', (error: Error) => {
+  console.error(error);
+});
 const server = http.createServer(createApp({ pool, config }));
 server.listen(config.port);
 process.once('SIGTERM', () => {

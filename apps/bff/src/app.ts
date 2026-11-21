@@ -1,4 +1,5 @@
 import type http from 'node:http';
+import { authRoutes } from './auth/routes.ts';
 import type pg from 'pg';
 import type { Config } from './config.ts';
 import { BadRequestError, checkOrigin, PayloadTooLargeError, sendError, sendJSON } from './http.ts';
@@ -13,6 +14,7 @@ type Route = {
 
 export function createApp(deps: Deps): http.RequestListener {
   const routes: Route[] = [
+    ...authRoutes(deps),
     { method: 'GET', pattern: /^\/healthz$/, handler: (_req, res) => sendJSON(res, 200, { ok: true }) },
   ];
   return (req, res) => {
