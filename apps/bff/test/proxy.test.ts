@@ -4,6 +4,7 @@ import http from 'node:http';
 import type { TestContext } from 'node:test';
 import test from 'node:test';
 import pg from 'pg';
+import { createApp } from '../src/app.ts';
 import { loadConfig } from '../src/config.ts';
 import { startApp } from './helpers/server.ts';
 
@@ -175,4 +176,33 @@ test('proxy preserves redirect status without following Location or copying it',
   assert.equal(await response.text(), 'redirect');
   assert.equal(response.headers.get('Location'), null);
   assert.equal(core.requests.length, 1);
+});
+
+
+test('proxy forwards normalized absolute request targets and retains the query', async (t) => {
+  const core = await fakeCore(t, 200, 'ok');
+  const pool = new pg.Pool({ connectionString: config.databaseUrl });
+  t.after(() => pool.end());
+  const server = http.createServer(createApp({ pool, config: { ...config, coreUrl: core.url } }));
+  t.after(() => new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+    server.closeAllConnections();
+  }));
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  assert.ok(address && typeof address !== 'string');
+  // Raw HTTP preserves the absolute target and dot segments that fetch normalizes locally.
+  await new Promise<void>((resolve, reject) => {
+    const request = http.request({ host: '127.0.0.1', port: address.port, method: 'GET',
+      path: 'http://localhost/api/v1/unused/../credits?x=1&name=a%2Fb', headers: cookie }, (response) => {
+      assert.equal(response.statusCode, 200);
+      response.resume();
+      response.on('end', resolve);
+      response.on('error', reject);
+    });
+    request.on('error', reject);
+    request.end();
+  });
+  assert.equal(core.requests[0]!.url, '/v1/credits?x=1&name=a%2Fb');
 });

@@ -22,8 +22,10 @@ export function proxyRoutes(deps: Deps) {
       const method = req.method ?? 'GET';
       // Keep body errors outside the upstream catch so app.ts can map size errors to 413.
       const body = method === 'GET' || method === 'HEAD' ? undefined : new Uint8Array(await readBody(req));
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      const path = url.pathname.slice('/api'.length) + url.search;
       try {
-        const upstream = await (deps.fetch ?? globalThis.fetch)(`${deps.config.coreUrl}${(req.url ?? '').slice('/api'.length)}`, {
+        const upstream = await (deps.fetch ?? globalThis.fetch)(`${deps.config.coreUrl}${path}`, {
           method, headers, body, signal: AbortSignal.timeout(30000), redirect: 'manual',
         });
         const bytes = Buffer.from(await upstream.arrayBuffer());

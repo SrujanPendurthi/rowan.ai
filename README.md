@@ -86,3 +86,35 @@ One credit per billable lookup; zero-hit and failed lookups are refunded. Other 
 - A run takes at most 500 distinct candidate refs (`400 invalid_request` above that). Candidates sharing one identity are looked up and billed once.
 - A run that stops early (timeout or provider rate-limit error) returns HTTP `200` once persisted, with `"status": "partial"` and an `"unprocessed"` count; credits for unprocessed candidates are refunded. The same key and body replay the stored response.
 - JSON responses apply the same tier `export_policy` gating as CSV exports: gated `field_value`, criterion `observed`, and `display_name` are `"[REDACTED]"`.
+
+## BFF
+
+The browser BFF requires Node >=24 and PostgreSQL. Run the core first: the core owns database migrations, and the BFF shares its database.
+
+Configure these environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Same PostgreSQL database used by the core |
+| `ROWAN_CORE_URL` | Core HTTP URL, for example `http://localhost:8080` |
+| `ROWAN_WEB_ORIGIN` | Exact browser origin allowed for mutating requests, for example `http://localhost:3000` |
+| `PORT` | BFF listen port; defaults to `8081` |
+| `ROWAN_COOKIE_SECURE` | Defaults to `true`; set `false` only for local HTTP |
+
+```sh
+export DATABASE_URL='postgres://rowan:rowan@localhost:54329/rowan?sslmode=disable'
+export ROWAN_CORE_URL='http://localhost:8080'
+export ROWAN_WEB_ORIGIN='http://localhost:3000'
+export ROWAN_COOKIE_SECURE=false
+cd apps/bff && npm ci && npm start
+```
+
+Browser sessions are core API keys of kind `session` that expire after 14 days. The BFF stores the token in an HttpOnly cookie and forwards authenticated `/api/v1/*` requests to the core. Logout revokes the session key at the core.
+
+Agents call the core directly with `rk_live_` keys created through the authenticated BFF endpoint `POST /api/keys`. New workspaces have zero credits until billing supplies them; seed local credits with `rowanctl`:
+
+```sh
+go run ./services/core/cmd/rowanctl credits topup --workspace "$WS" --credits 100
+```
+
+From the repository root, `make test` runs both Go tests with `-race` and BFF type checking and tests. Start PostgreSQL on port 54329 with `make db-up` first.
