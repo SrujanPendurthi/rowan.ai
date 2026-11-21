@@ -22,7 +22,10 @@ const usage = `usage:
   rowanctl workspace create --name NAME --tier solo|deal_team|fund
   rowanctl key create --workspace ID --cap CREDITS --rate PER_MINUTE [--label LABEL]
   rowanctl credits grant-period --workspace ID --period YYYY-MM-01
-  rowanctl credits topup --workspace ID --credits N`
+  rowanctl credits topup --workspace ID --credits N
+  rowanctl load sam|sunbiz-corp|sunbiz-events|dbpr FILE
+  rowanctl fetch dbpr
+  rowanctl fetch sam --month MM/YYYY   (needs SAM_API_KEY)`
 
 func main() {
 	ctx := context.Background()
@@ -43,6 +46,12 @@ func main() {
 func run(ctx context.Context, pool *pgxpool.Pool, args []string, out io.Writer, now func() time.Time) error {
 	if len(args) < 2 {
 		return errors.New(usage)
+	}
+	switch args[0] {
+	case "load":
+		return loadCmd(ctx, pool, args[1:], out, now)
+	case "fetch":
+		return fetchCmd(ctx, pool, args[1:], out, now)
 	}
 	switch args[0] + " " + args[1] {
 	case "workspace create":

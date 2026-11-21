@@ -17,7 +17,7 @@ export DATABASE_URL='postgres://rowan:rowan@localhost:54329/rowan?sslmode=disabl
 ROWAN_PROVIDER=fake ROWAN_ARTIFACT_DIR=./artifacts go run ./services/core/cmd/core   # :8080, or set PORT
 ```
 
-The server migrates the database on start. `ROWAN_PROVIDER=fake` is the only provider in v1; it returns zero hits for every lookup.
+The server migrates the database on start. `ROWAN_PROVIDER=fake` returns zero hits for every lookup. `ROWAN_PROVIDER=registry` answers lookups from loaded public-record data (see Data sources).
 
 ## Seed
 
@@ -31,6 +31,33 @@ go run ./services/core/cmd/rowanctl credits topup --workspace $WS --credits 100
 ```
 
 The token is shown once; only its hash is stored. `--cap` is the key's monthly spend cap in credits, `--rate` is requests per minute.
+
+## Data sources
+
+Three public registries feed `ROWAN_PROVIDER=registry`. All are Florida-scoped in v1. Every citation is `verified_filing`.
+
+| Source | System | How to get the file |
+|---|---|---|
+| SAM.gov public monthly entity extract | `sam` | `fetch sam` (needs `SAM_API_KEY`), or download the `.zip`/`.dat` yourself |
+| Florida Sunbiz corporate + event files | `fl_sunbiz` | Manual, via the state's SFTP (the download page blocks automation) |
+| Florida DBPR contractor/electrical licenses | `fl_dbpr` | `fetch dbpr` (weekly public CSVs) |
+
+```sh
+export DATABASE_URL=...  ROWAN_SNAPSHOT_DIR=./data/snapshots   # snapshot dir defaults to ./data/snapshots
+go run ./services/core/cmd/rowanctl load sam SAM_PUBLIC_MONTHLY_V2_20261101.ZIP
+go run ./services/core/cmd/rowanctl load sunbiz-corp cordata.txt
+go run ./services/core/cmd/rowanctl load sunbiz-events corevent.txt
+go run ./services/core/cmd/rowanctl load dbpr CONSTRUCTIONLICENSE_1.csv
+go run ./services/core/cmd/rowanctl fetch dbpr                    # downloads both DBPR files, then loads each
+SAM_API_KEY=... go run ./services/core/cmd/rowanctl fetch sam --month 11/2026
+```
+
+Each command prints its load stats as one JSON line. Re-loading a file is idempotent. Changes between loads become dated signals that feed each company's `proxy_summary`.
+
+- A personal SAM.gov key allows 10 requests/day. Use one `fetch sam` per month; the key is never stored or printed.
+- Registry data is shared public data (global tables). `source_records`, companies, and credits stay per workspace.
+- Fetched files are cited by snapshot hash as `source_ref`; `load` cites the file name.
+- Schedule `fetch dbpr` weekly and `fetch sam` monthly from cron; there is no in-process scheduler.
 
 ## Use
 
