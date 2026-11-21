@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"path"
+	"path/filepath"
 	"regexp"
 	"time"
 
@@ -93,11 +95,15 @@ func loadCmd(ctx context.Context, pool *pgxpool.Pool, args []string, out io.Writ
 }
 
 func fetchCmd(ctx context.Context, pool *pgxpool.Pool, args []string, out io.Writer, now func() time.Time) error {
-	var urls []string
+	type target struct{ url, name string }
+	var targets []target
 	var ld loader
 	switch args[0] {
 	case "dbpr":
-		urls, ld = []string{dbprBase + dbprConstructionPath, dbprBase + dbprElectricalPath}, loaders["dbpr"]
+		for _, p := range []string{dbprConstructionPath, dbprElectricalPath} {
+			targets = append(targets, target{dbprBase + p, path.Base(p)})
+		}
+		ld = loaders["dbpr"]
 	case "sam":
 		fs := newFlags("fetch sam")
 		month := fs.String("month", "", "extract month, MM/YYYY")
@@ -113,7 +119,10 @@ func fetchCmd(ctx context.Context, pool *pgxpool.Pool, args []string, out io.Wri
 		}
 		q := url.Values{"api_key": {key}, "fileType": {"ENTITY"}, "sensitivity": {"PUBLIC"},
 			"frequency": {"MONTHLY"}, "date": {*month}, "charset": {"UTF8"}}
-		urls, ld = []string{samBase + "/data-services/v1/extracts?" + q.Encode()}, loaders["sam"]
+		// ponytail: SAM file name is synthesized from --month; the API's real file name isn't captured.
+		name := "SAM_PUBLIC_MONTHLY_V2_" + (*month)[3:] + (*month)[:2] + ".zip"
+		targets = append(targets, target{samBase + "/data-services/v1/extracts?" + q.Encode(), name})
+		ld = loaders["sam"]
 	default:
 		return errors.New(usage)
 	}
@@ -122,15 +131,29 @@ func fetchCmd(ctx context.Context, pool *pgxpool.Pool, args []string, out io.Wri
 		dir = "./data/snapshots"
 	}
 	f := &fetch.Fetcher{Pool: pool, SnapshotDir: dir, Now: now}
-	for _, u := range urls {
-		res, err := f.Get(ctx, u)
+	for _, t := range targets {
+		res, err := f.Get(ctx, t.url) // error already names the redacted URL
 		if err != nil {
-			return fmt.Errorf("fetch %s: %w", fetch.RedactURL(u), err)
+			return err
 		}
-		// ponytail: loaders take FileName from the path base, so citations show the snapshot hash as source_ref.
-		if err := loadFile(ctx, pool, ld, res.Path, res.SnapshotRef, out, now); err != nil {
+		if err := loadNamed(ctx, pool, ld, res, t.name, out, now); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// loadNamed symlinks the extensionless snapshot under its source name so the
+// loader sees the right extension and cites the source file name.
+func loadNamed(ctx context.Context, pool *pgxpool.Pool, ld loader, res fetch.Result, name string, out io.Writer, now func() time.Time) error {
+	dir, err := os.MkdirTemp("", "rowanctl-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+	link := filepath.Join(dir, name)
+	if err := os.Symlink(res.Path, link); err != nil {
+		return fmt.Errorf("link snapshot: %w", err)
+	}
+	return loadFile(ctx, pool, ld, link, res.SnapshotRef, out, now)
 }

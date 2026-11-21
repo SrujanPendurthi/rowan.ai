@@ -56,7 +56,7 @@ Each command prints its load stats as one JSON line. Re-loading a file is idempo
 
 - A personal SAM.gov key allows 10 requests/day. Use one `fetch sam` per month; the key is never stored or printed.
 - Registry data is shared public data (global tables). `source_records`, companies, and credits stay per workspace.
-- Fetched files are cited by snapshot hash as `source_ref`; `load` cites the file name.
+- Fetched files are cited by source name (DBPR URL file name; SAM `SAM_PUBLIC_MONTHLY_V2_YYYYMM.zip` built from `--month`), like `load`.
 - Schedule `fetch dbpr` weekly and `fetch sam` monthly from cron; there is no in-process scheduler.
 
 ## Use

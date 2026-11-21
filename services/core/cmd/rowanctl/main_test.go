@@ -1,11 +1,13 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -110,11 +112,50 @@ func TestFetchDBPRUsesFetcher(t *testing.T) {
 	if err := run(context.Background(), pool, []string{"fetch", "dbpr"}, &out, time.Now); err != nil {
 		t.Fatal(err)
 	}
-	var n int
-	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM registry_entities WHERE source_system='fl_dbpr'`).Scan(&n); err != nil || n < 3 {
-		t.Fatalf("entities = %d, %v; out %s", n, err, out.String())
+	for _, name := range []string{"CONSTRUCTIONLICENSE_1.csv", "lic08el.csv"} {
+		var n int
+		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM registry_entities WHERE source_system='fl_dbpr' AND file_name=$1`, name).Scan(&n); err != nil || n != 2 {
+			t.Fatalf("%s entities = %d, %v; out %s", name, n, err, out.String())
+		}
 	}
 	if lines := strings.Count(strings.TrimSpace(out.String()), "\n") + 1; lines != 2 {
 		t.Fatalf("want one JSON line per file, got %q", out.String())
+	}
+}
+
+func TestFetchSAMLoads(t *testing.T) {
+	dat, err := os.ReadFile(fixtures + "sam_public_v2.dat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var zb bytes.Buffer
+	zw := zip.NewWriter(&zb)
+	w, _ := zw.Create("SAM_PUBLIC_MONTHLY_V2_20261101.dat")
+	w.Write(dat)
+	zw.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/data-services/v1/extracts" || r.URL.Query().Get("date") != "11/2026" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(zb.Bytes())
+	}))
+	defer srv.Close()
+	old := samBase
+	samBase = srv.URL
+	defer func() { samBase = old }()
+	t.Setenv("SAM_API_KEY", "secret")
+	t.Setenv("ROWAN_SNAPSHOT_DIR", t.TempDir())
+	pool := testdb.New(t)
+	var out bytes.Buffer
+	if err := run(context.Background(), pool, []string{"fetch", "sam", "--month", "11/2026"}, &out, time.Now); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM registry_entities WHERE source_system='sam' AND file_name='SAM_PUBLIC_MONTHLY_V2_202611.zip'`).Scan(&n); err != nil || n == 0 {
+		t.Fatalf("entities = %d, %v; out %s", n, err, out.String())
+	}
+	if strings.Contains(out.String(), "secret") {
+		t.Fatal("key leaked")
 	}
 }
