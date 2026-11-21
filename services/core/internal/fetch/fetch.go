@@ -56,6 +56,7 @@ type hostState struct {
 	robotsLock   chan struct{}
 	robots       rules
 	robotsAt     time.Time
+	robotsTTL    time.Duration
 	robotsLoaded bool
 }
 
@@ -160,9 +161,9 @@ func retryDelay(header string, attempt int) time.Duration {
 	if seconds, err := strconv.ParseUint(strings.TrimSpace(header), 10, 64); err == nil || errors.Is(err, strconv.ErrRange) {
 		return time.Duration(min(seconds, 300)) * time.Second
 	}
-	// Saturation prevents overflow for unusually large configured retry counts.
-	if attempt >= 34 {
-		return time.Duration(math.MaxInt64)
+	// Cap before shifting so large retry counts cannot overflow the duration.
+	if attempt >= 9 {
+		return 5 * time.Minute
 	}
 	return time.Second * time.Duration(uint64(1)<<attempt)
 }
@@ -282,6 +283,14 @@ func (f *Fetcher) request(ctx context.Context, u *url.URL, headers http.Header, 
 			next, parseErr := u.Parse(location)
 			if parseErr != nil {
 				return nil, safeFailure("fetch: invalid redirect URL", parseErr)
+			}
+			if u.Scheme == "https" && next.Scheme == "http" {
+				return nil, fmt.Errorf("fetch: HTTPS to HTTP redirect disallowed: %s", RedactURL(next.String()))
+			}
+			if !strings.EqualFold(u.Host, next.Host) {
+				headers = headers.Clone()
+				headers.Del("If-None-Match")
+				headers.Del("If-Modified-Since")
 			}
 			u = next
 		default:

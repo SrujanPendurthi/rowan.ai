@@ -105,10 +105,11 @@ func (f *Fetcher) checkRobots(ctx context.Context, u *url.URL, host *hostState) 
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	if !host.robotsLoaded || f.now().Sub(host.robotsAt) >= 24*time.Hour {
+	if !host.robotsLoaded || f.now().Sub(host.robotsAt) >= host.robotsTTL {
 		robotURL := &url.URL{Scheme: u.Scheme, Host: u.Host, Path: "/robots.txt"}
 		resp, err := f.request(ctx, robotURL, nil, false)
 		var policy rules
+		ttl := 5 * time.Minute
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -121,11 +122,13 @@ func (f *Fetcher) checkRobots(ctx context.Context, u *url.URL, host *hostState) 
 				body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxRobotsBytes+1))
 				if readErr == nil && len(body) <= maxRobotsBytes {
 					policy = parseRobots(body, "rowanbot")
+					ttl = 24 * time.Hour
 				} else {
 					policy = parseRobots([]byte("User-agent: *\nDisallow: /"), "rowanbot")
 				}
-			case resp.StatusCode >= 400 && resp.StatusCode < 500:
+			case resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != 429:
 				// A missing or inaccessible robots file permits all paths.
+				ttl = 24 * time.Hour
 			default:
 				policy = parseRobots([]byte("User-agent: *\nDisallow: /"), "rowanbot")
 			}
@@ -135,6 +138,7 @@ func (f *Fetcher) checkRobots(ctx context.Context, u *url.URL, host *hostState) 
 			}
 		}
 		host.robots, host.robotsAt, host.robotsLoaded = policy, f.now(), true
+		host.robotsTTL = ttl
 	}
 	path := u.EscapedPath()
 	if path == "" {

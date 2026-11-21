@@ -114,6 +114,97 @@ func TestGetRobotsDisallow(t *testing.T) {
 func TestGetRobots404AllowsAll(t *testing.T) { testRobotsStatus(t, 404, "", false) }
 func TestGetRobots500Disallows(t *testing.T) { testRobotsStatus(t, 500, "", true) }
 
+func TestGetRobots429DisallowsAfterRetries(t *testing.T) {
+	var robotsHits, targetHits atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			robotsHits.Add(1)
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		targetHits.Add(1)
+		fmt.Fprint(w, "hello")
+	}))
+	defer s.Close()
+	f := newTestFetcher(t, s)
+	f.MaxRetries = 2
+	f.sleep = func(time.Duration) {}
+	_, err := f.Get(context.Background(), s.URL+"/x")
+	if !errors.Is(err, ErrDisallowed) || robotsHits.Load() != 3 || targetHits.Load() != 0 {
+		t.Fatalf("robots 429: err=%v robots=%d target=%d", err, robotsHits.Load(), targetHits.Load())
+	}
+}
+
+func TestGetRobotsPolicyCacheTTL(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		ttl    time.Duration
+	}{
+		{"500", 500, 5 * time.Minute}, {"503", 503, 5 * time.Minute},
+		{"network", 0, 5 * time.Minute}, {"429", 429, 5 * time.Minute},
+		{"success", 200, 24 * time.Hour}, {"404", 404, 24 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var recovered atomic.Bool
+			var robotsHits atomic.Int32
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/robots.txt" {
+					fmt.Fprint(w, "hello")
+					return
+				}
+				robotsHits.Add(1)
+				if recovered.Load() {
+					return
+				}
+				if tc.status == 0 {
+					conn, _, err := w.(http.Hijacker).Hijack()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					conn.Close()
+					return
+				}
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, "User-agent: rowanbot\nDisallow: /")
+			}))
+			defer s.Close()
+			f := newTestFetcher(t, s)
+			f.MaxRetries = 2
+			f.sleep = func(time.Duration) {}
+			now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+			f.Now = func() time.Time { return now }
+			checkInitialPolicy := func() {
+				t.Helper()
+				_, err := f.Get(context.Background(), s.URL+"/x")
+				if tc.status == 404 {
+					if err != nil {
+						t.Fatalf("4xx policy must allow: %v", err)
+					}
+				} else if !errors.Is(err, ErrDisallowed) {
+					t.Fatalf("initial policy must disallow: %v", err)
+				}
+			}
+			checkInitialPolicy()
+			initialHits := robotsHits.Load()
+			recovered.Store(true)
+			now = now.Add(tc.ttl - time.Nanosecond)
+			checkInitialPolicy()
+			if robotsHits.Load() != initialHits {
+				t.Fatal("policy refreshed before TTL")
+			}
+			now = now.Add(time.Nanosecond)
+			if _, err := f.Get(context.Background(), s.URL+"/x"); err != nil {
+				t.Fatalf("expired policy did not recover: %v", err)
+			}
+			if robotsHits.Load() != initialHits+1 {
+				t.Fatalf("expired policy not fetched: initial=%d now=%d", initialHits, robotsHits.Load())
+			}
+		})
+	}
+}
+
 func testRobotsStatus(t *testing.T, status int, body string, disallow bool) {
 	t.Helper()
 	var hits atomic.Int32
@@ -507,11 +598,125 @@ func TestRedactURL(t *testing.T) {
 }
 
 func TestRetryDelayBackoff(t *testing.T) {
-	if got := retryDelay("", 10); got != 1024*time.Second {
-		t.Fatalf("backoff = %v, want 1024s", got)
+	for _, tc := range []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{0, time.Second}, {1, 2 * time.Second}, {8, 256 * time.Second},
+		{9, 5 * time.Minute}, {10, 5 * time.Minute}, {1000, 5 * time.Minute},
+	} {
+		for _, header := range []string{"", "invalid"} {
+			if got := retryDelay(header, tc.attempt); got != tc.want {
+				t.Errorf("backoff(%q, %d) = %v, want %v", header, tc.attempt, got, tc.want)
+			}
+		}
 	}
 	if got := retryDelay("184467440737095516160", 0); got != 5*time.Minute {
 		t.Fatalf("overflow Retry-After = %v", got)
+	}
+}
+
+func TestGetRedirectScopesConditionalHeaders(t *testing.T) {
+	for _, sameHost := range []bool{false, true} {
+		t.Run(fmt.Sprintf("same-host=%t", sameHost), func(t *testing.T) {
+			var redirect atomic.Bool
+			var targetHits atomic.Int32
+			targetHandler := func(w http.ResponseWriter, r *http.Request) {
+				targetHits.Add(1)
+				if r.Header.Get("If-None-Match") == `"stale"` || r.Header.Get("If-Modified-Since") != "" {
+					w.WriteHeader(http.StatusNotModified)
+					return
+				}
+				fmt.Fprint(w, "body from B")
+			}
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/robots.txt" {
+					http.NotFound(w, r)
+					return
+				}
+				targetHandler(w, r)
+			}))
+			defer target.Close()
+			location := target.URL + "/b"
+			if sameHost {
+				location = "/b"
+			}
+			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/robots.txt" {
+					http.NotFound(w, r)
+					return
+				}
+				if r.URL.Path == "/b" {
+					targetHandler(w, r)
+					return
+				}
+				if redirect.Load() {
+					if r.Header.Get("If-None-Match") != `"stale"` || r.Header.Get("If-Modified-Since") == "" {
+						t.Error("original host lost validators")
+					}
+					http.Redirect(w, r, location, http.StatusFound)
+					return
+				}
+				w.Header().Set("ETag", `"stale"`)
+				w.Header().Set("Last-Modified", "Thu, 19 Nov 2026 12:00:00 GMT")
+				fmt.Fprint(w, "body from A")
+			}))
+			defer source.Close()
+			f := newTestFetcher(t, source)
+			u, _ := url.Parse(target.URL)
+			f.HostRate[u.Host] = rate.Inf
+			if _, err := f.Get(context.Background(), source.URL+"/a"); err != nil {
+				t.Fatal(err)
+			}
+			redirect.Store(true)
+			got, err := f.Get(context.Background(), source.URL+"/a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile(got.Path)
+			want := "body from B"
+			if sameHost {
+				want = "body from A"
+			}
+			if err != nil || string(body) != want || got.NotModified != sameHost || targetHits.Load() != 1 {
+				t.Fatalf("redirect result: body=%q notModified=%t hits=%d err=%v", body, got.NotModified, targetHits.Load(), err)
+			}
+		})
+	}
+}
+
+func TestGetRefusesHTTPSDowngrade(t *testing.T) {
+	var targetHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits.Add(1)
+		if r.URL.Path == "/robots.txt" {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprint(w, "insecure body")
+	}))
+	defer target.Close()
+	location := target.URL + "/b?token=REDIRECT_SECRET"
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, location, http.StatusFound)
+	}))
+	defer source.Close()
+	f := newTestFetcher(t, source)
+	u, _ := url.Parse(target.URL)
+	f.HostRate[u.Host] = rate.Inf
+	_, err := f.Get(context.Background(), source.URL+"/a?api_key=SOURCE_SECRET")
+	if err == nil {
+		t.Fatal("HTTPS to HTTP redirect succeeded")
+	}
+	if !strings.Contains(err.Error(), RedactURL(location)) || strings.Contains(err.Error(), "SECRET") {
+		t.Fatalf("downgrade error missing redacted destination: %v", err)
+	}
+	if targetHits.Load() != 0 {
+		t.Fatalf("downgrade contacted HTTP server %d times", targetHits.Load())
 	}
 }
 
