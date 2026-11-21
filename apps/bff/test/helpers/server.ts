@@ -32,7 +32,8 @@ export async function startApp(t: TestContext, deps: Deps): Promise<Client> {
       const response = await fetch(new URL(path, baseURL), {
         method,
         headers,
-        ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
+        ...(opts.body !== undefined ? { body: typeof opts.body === 'string' ? opts.body
+          : Buffer.isBuffer(opts.body) ? new Uint8Array(opts.body) : JSON.stringify(opts.body) } : {}),
         redirect: 'manual',
       });
       for (const cookie of response.headers.getSetCookie()) {

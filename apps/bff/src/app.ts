@@ -1,6 +1,7 @@
 import type http from 'node:http';
 import { authRoutes } from './auth/routes.ts';
 import { keysRoutes } from './keys/routes.ts';
+import { proxyRoutes } from './proxy.ts';
 import type pg from 'pg';
 import type { Config } from './config.ts';
 import { BadRequestError, checkOrigin, PayloadTooLargeError, sendError, sendJSON } from './http.ts';
@@ -17,6 +18,7 @@ export function createApp(deps: Deps): http.RequestListener {
   const routes: Route[] = [
     ...authRoutes(deps),
     ...keysRoutes(deps),
+    ...proxyRoutes(deps),
     { method: 'GET', pattern: /^\/healthz$/, handler: (_req, res) => sendJSON(res, 200, { ok: true }) },
   ];
   return (req, res) => {
@@ -27,7 +29,7 @@ export function createApp(deps: Deps): http.RequestListener {
         sendError(res, 403, 'origin_forbidden', 'origin forbidden');
         return;
       }
-      const route = routes.find((entry) => entry.method === req.method && entry.pattern.test(path));
+      const route = routes.find((entry) => (entry.method === '*' || entry.method === req.method) && entry.pattern.test(path));
       if (route) await route.handler(req, res);
       else sendError(res, 404, 'not_found', 'not found');
     })().catch((error: unknown) => {
