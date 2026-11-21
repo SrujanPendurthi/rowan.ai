@@ -43,7 +43,7 @@ func NewToken() (string, error) {
 	return tokenPrefix + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(raw[:]), nil
 }
 
-func (s *server) authenticate(ctx context.Context, r *http.Request) (apiKey, error) {
+func (s *server) authenticate(ctx context.Context, r *http.Request, now time.Time) (apiKey, error) {
 	scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
 	token = strings.TrimSpace(token)
 	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" {
@@ -51,7 +51,8 @@ func (s *server) authenticate(ctx context.Context, r *http.Request) (apiKey, err
 	}
 	var k apiKey
 	err := s.Pool.QueryRow(ctx, `SELECT id::text, workspace_id::text, monthly_spend_cap, rate_per_minute
-		FROM api_keys WHERE key_hash=$1 AND revoked_at IS NULL`, HashKey(token)).
+		FROM api_keys WHERE key_hash=$1 AND revoked_at IS NULL
+		AND (expires_at IS NULL OR expires_at > $2)`, HashKey(token), now).
 		Scan(&k.ID, &k.WorkspaceID, &k.SpendCap, &k.RatePerMinute)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return apiKey{}, errUnauthorized

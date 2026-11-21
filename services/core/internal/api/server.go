@@ -107,7 +107,7 @@ func New(deps Deps) http.Handler {
 func (s *server) wrap(idempotent bool, h handlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		now := s.Now().UTC()
-		key, err := s.authenticate(r.Context(), r)
+		key, err := s.authenticate(r.Context(), r, now)
 		if err != nil {
 			s.write(w, mapError(err))
 			return
