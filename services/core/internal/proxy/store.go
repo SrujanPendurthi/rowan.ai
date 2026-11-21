@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,6 +15,15 @@ import (
 // Recompute rebuilds canonical_companies.proxy_summary from registry_signals reachable
 // through the company's active links. A missing company row is a no-op.
 func Recompute(ctx context.Context, tx pgx.Tx, canonicalID string, now time.Time) (Summary, error) {
+	// Row lock serializes concurrent recomputes so a stale batch run cannot overwrite a fresher summary.
+	var one int
+	err := tx.QueryRow(ctx, `SELECT 1 FROM canonical_companies WHERE id=$1 FOR UPDATE`, canonicalID).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Summary{}, nil
+	}
+	if err != nil {
+		return Summary{}, fmt.Errorf("lock proxy company: %w", err)
+	}
 	rows, err := tx.Query(ctx, `SELECT s.signal_type,s.observed_at,s.citation
 		FROM registry_signals s
 		JOIN source_records r ON (r.source_system, r.external_ref) = (s.source_system, s.external_ref)
@@ -52,6 +62,7 @@ func Recompute(ctx context.Context, tx pgx.Tx, canonicalID string, now time.Time
 }
 
 // RecomputeAll refreshes every company with a linked signal or an existing summary, one tx per company.
+// ponytail: RecomputeAll scans every company with a summary; batch/paginate if this gets slow
 func RecomputeAll(ctx context.Context, pool *pgxpool.Pool, now time.Time) (int, error) {
 	ids, err := queryIDs(ctx, pool, `SELECT id::text FROM canonical_companies c
 		WHERE c.proxy_summary IS NOT NULL OR EXISTS (

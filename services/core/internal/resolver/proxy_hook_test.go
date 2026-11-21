@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"rowan.ai/rowan/services/core/internal/quality"
 	"rowan.ai/rowan/services/core/internal/testdb"
 )
 
@@ -67,5 +68,31 @@ func TestSplitRecomputesProxy(t *testing.T) {
 	}
 	if got := proxyLabel(t, pool, newID); got != "post_sale_proxy" {
 		t.Fatalf("new label=%q", got)
+	}
+}
+
+func TestResolveReviewMergeRecomputesProxy(t *testing.T) {
+	pool := testdb.New(t)
+	w := seedWorkspace(t, pool)
+	first := ingest(t, pool, recordInput(w, "first", RecordFacts{LegalName: "Acme LLC", State: "TX"}))
+	execSQL(t, pool, `INSERT INTO registry_signals(source_system,external_ref,signal_type,observed_at,citation,dedupe_key)
+		VALUES ('filing','second','officer_change',$1,$2,'k')`, resolverNow.AddDate(0, -7, 0), sunbizCitation)
+	in := recordInput(w, "second", RecordFacts{LegalName: "Other Corp", DBA: "ACME", State: "tx"})
+	in.Citations = []quality.Citation{stateCitation(quality.ScrapedWeb)}
+	second := ingest(t, pool, in)
+	if second.Decision != Review || second.CanonicalID == first.CanonicalID {
+		t.Fatalf("expected review band: %+v", second)
+	}
+	if got := proxyLabel(t, pool, first.CanonicalID); got != "none" {
+		t.Fatalf("target before merge label=%q", got)
+	}
+	if err := review(t, pool, second.ReviewCandidateID, "merge", resolverNow); err != nil {
+		t.Fatal(err)
+	}
+	if got := proxyLabel(t, pool, first.CanonicalID); got != "post_sale_proxy" {
+		t.Fatalf("survivor label=%q", got)
+	}
+	if n := countSQL(t, pool, `SELECT count(*) FROM canonical_companies WHERE id=$1`, second.CanonicalID); n != 0 {
+		t.Fatal("merged canonical not deleted")
 	}
 }

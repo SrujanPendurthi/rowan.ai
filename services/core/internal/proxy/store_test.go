@@ -139,3 +139,33 @@ func TestRecomputeForRefs(t *testing.T) {
 		t.Fatalf("stored %+v", s)
 	}
 }
+
+// A recompute must wait for a concurrent writer holding the company row, then read fresh data.
+func TestRecomputeWaitsForCompanyLock(t *testing.T) {
+	pool, c := seed(t, now.AddDate(0, -5, 0))
+	ctx := context.Background()
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx)
+	if _, err := holder.Exec(ctx, `SELECT 1 FROM canonical_companies WHERE id=$1 FOR UPDATE`, c); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := proxy.RecomputeForRefs(ctx, pool, "fl_sunbiz", []string{ref}, now)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("recompute did not wait for row lock: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

@@ -75,6 +75,7 @@ func run(ctx context.Context) error {
 		IdleTimeout:  120 * time.Second,
 	}
 	go sweep(ctx, pool)
+	go proxyLoop(ctx, pool)
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
 	log.Printf("core listening on :%s", port)
@@ -96,16 +97,25 @@ func run(ctx context.Context) error {
 func sweep(ctx context.Context, pool *pgxpool.Pool) {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	proxyTicker := time.NewTicker(24 * time.Hour)
-	defer proxyTicker.Stop()
-	recomputeProxies(ctx, pool)
 	for {
 		sweepOnce(ctx, pool)
 		select {
 		case <-ctx.Done():
 			return
-		case <-proxyTicker.C:
-			recomputeProxies(ctx, pool)
+		case <-ticker.C:
+		}
+	}
+}
+
+// proxyLoop recomputes proxy summaries at startup, then daily until ctx ends. Errors are logged.
+func proxyLoop(ctx context.Context, pool *pgxpool.Pool) {
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		recomputeProxies(ctx, pool)
+		select {
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
 		}
 	}
