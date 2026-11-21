@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -180,10 +181,15 @@ func loadBatch(ctx context.Context, pool *pgxpool.Pool, meta LoadMeta, entities 
 }
 
 func normalizedNames(e Entity) []string {
-	names := make([]string, 0, 2)
-	for _, name := range []string{e.Facts.LegalName, e.Facts.DBA} {
+	candidates := []string{e.Facts.LegalName, e.Facts.DBA}
+	if e.SourceSystem == "fl_dbpr" {
+		// Licensees may trade under a DBA; retain both searchable names.
+		candidates = append(candidates, e.Facts.Principal)
+	}
+	names := make([]string, 0, len(candidates))
+	for _, name := range candidates {
 		name = resolver.NormalizeName(name)
-		if name != "" && (len(names) == 0 || names[0] != name) {
+		if name != "" && !slices.Contains(names, name) {
 			names = append(names, name)
 		}
 	}
